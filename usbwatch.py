@@ -108,6 +108,52 @@ def wait_android_boot(max_wait=240):
     return False
 
 
+def battery_level(serial=None):
+    """读电量百分比，读不到返回 None。"""
+    dev = serial or any_device()
+    if not dev:
+        return None
+    out = sh(dev, "dumpsys battery | grep level", timeout=12)
+    for line in out.splitlines():
+        if "level" in line:
+            try:
+                return int(line.split(":")[1].strip())
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def battery_ok(min_level=None):
+    """电量够不够跑一轮。
+
+    板子 USB 口只给 5V/0.5A，手机跑流程时是净放电。电量太低时跑到一半
+    会直接关机（实测发生过：25% 电量，第 4 步掉线，随后进 05c6 关机模式）。
+    """
+    floor = int(min_level if min_level is not None
+                else os.environ.get("MIN_BATTERY", "20"))
+    lv = battery_level()
+    if lv is None:
+        return True, "电量读不到，照跑"
+    if lv < floor:
+        return False, "电量 %d%%，低于 %d%%，先不跑（USB 只有 500mA，会跑到一半关机）" % (
+            lv, floor)
+    return True, "电量 %d%%" % lv
+
+
+def wait_system_ready_here(max_wait=180, settle=15):
+    """等系统服务注册完 + 稳定期。
+
+    settle 默认 15 秒：服务在了不等于 UI 能点。开机后马上点，
+    会撞在首屏动画和资源加载上，点了没反应。
+    """
+    try:
+        sys.path.insert(0, HERE)
+        import airlib
+        return airlib.wait_system_ready(SERIAL, max_wait=max_wait, settle=settle)
+    except Exception as e:
+        return False, "等系统就绪失败（%s），跳过" % e
+
+
 def run_flow():
     """调 airweb 跑流程。"""
     url = os.environ.get("AIRWEB", "http://127.0.0.1:8123")
@@ -119,7 +165,21 @@ def run_flow():
         log("流程文件读不了: %s" % e)
         return False
     # 手机可能刚开机，等它真的起来再动手
-    wait_android_boot()
+    ok_bat, why_bat = battery_ok()
+    log(why_bat)
+    if not ok_bat:
+        log(">>> 跳过本次：先充电")
+        return False
+
+    boot_ok = wait_android_boot()
+    # boot_completed=1 只是"启动流程走完"，system_server 的服务可能还在注册。
+    # 实测踩过：流程开跑时 `screencap` 报 Can't find service: window，
+    # 第 4 步直接 BrokenPipeError。所以再等系统服务真的能用。
+    if boot_ok:
+        ok, why = wait_system_ready_here()
+        log(why)
+        if not ok:
+            log("系统没就绪，仍然试着跑（比直接放弃强）")
     log(">>> 开始执行流程（%d 步）" % len(steps))
     try:
         out = subprocess.run(

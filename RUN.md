@@ -860,3 +860,337 @@ autocast 启动
 `timesync.sh` 里尝试写回 RTC 的那步可以真正确保"装上电池后立刻生效"。
 如果不想每次开机都靠网络，给板子装一颗 CR2032（`hym8563` 支持），
 RTC 就能保持时间，`rtc information is invalid` 也会消失。
+
+## 已发布到 GitHub（2026-11-12 13:50）
+
+https://github.com/chengmeiqq/rk3588-autocast
+
+### 为什么是独立仓库，而不是这个目录
+
+`/root/.openclaw/workspace/Airtest` 是 **Airtest 官方仓库的克隆**
+（remote 指向 `AirtestProject/Airtest`，506 个上游文件）。我们的代码是叠加
+在它上面的自动化项目，**绝不能推到上游**。
+
+所以抽成独立仓库：27 个自有文件（脚本、流程、模板、文档），
+依赖通过 `requirements.txt` 装官方 `airtest` 包。
+
+| 提交到 GitHub | 留在本地 |
+|---|---|
+| `airweb.py` `airlib.py` `usbwatch.py` `keytrigger.py` `autowatch.py` `airctl` | `.venv/`（245M） |
+| `flows/` `templates/` `macros/` | `logs/`（8.5M） |
+| `start-*.sh` `stop-all.sh` `timesync.sh` `env.sh` | `*.bak` |
+| `README.md` `RUN.md` `requirements.txt` `ui.html` | 上游 506 个文件 |
+
+验证：`git rev-parse HEAD` == `git ls-remote origin refs/heads/master`
+（`7222144`）；`logs`/`.venv`/`*.bak`/大图 在远端全部 404。
+
+### 两处为公开做的调整
+
+- `airlib.py` 的设备序列号兜底从硬编码改成读 `PHONE_SERIAL` 环境变量
+  （`usbwatch.py` 本来就是这么做的）
+- `macros/demo-home.png`（3.4M 演示原图，含手机界面）没上传，
+  加进了 `.gitignore`
+
+### 安全提醒
+
+提供的 token 权限范围很大，包含 `delete_repo`、`admin:org`、
+`admin:enterprise`、`workflow`。只用到 `repo` 就够。建议换成
+细粒度 token（只勾 `rk3588-autocast` 的 Contents: read/write），
+并轮换这个。用完已 `shred` 销毁临时文件，未写入 `.git/config`
+或 remote URL；本地记忆文件里的明文也已抹除。
+
+## 14:22 那次失败的真实原因（2026-11-12 排查）
+
+> **注意：本节关于"供电不足导致关机"的结论后续被实测推翻。**
+> `Max charging current: 500000` 是上限协商值，不代表实际净电流；
+> 实测连着 USB 时电量持续上涨。真正的死因是 MIUI 的
+> `SwipeUpClean` / `OptimizationClean` 清理进程。
+> 请以下面「后续复核」一节为准。
+
+现象：只打开了豆包，第 4 步「打电话」没做，日志报 3 次
+`BrokenPipeError: [Errno 32] Broken pipe`，3/7 步通过后退出。
+
+### 时间线（dmesg + 手机 btime 对齐）
+
+```
+14:22:23  USB disconnect, device 9
+14:22:39  重新枚举 idVendor=18d1 (Android)
+14:22:43  usbwatch 开跑（手机 btime=14:22:25，只开机 18 秒）
+          1 唤醒 ✓   2 关 USB 弹窗 ✓   3 启动豆包 ✓
+          4 点「打电话」✗ BrokenPipeError (709ms / 280ms / 342ms)
+14:23:05  3/7 失败退出
+14:26:43  USB disconnect, device 10
+14:27:24  重新枚举 idVendor=05c6 idProduct=f000 ← 关机充电模式
+```
+
+`05c6:f000` + `bInterfaceClass=08 (MassStorage)` 是手机**完全关机**后
+只剩充电芯片在跑的枚举结果，adb 根本连不上。
+
+### 三个层次的原因
+
+**1. `sys.boot_completed=1` 不等于系统能用（真 bug）**
+
+手机 btime 14:22:25，流程 14:22:43 开跑 —— 只启动 18 秒。
+`boot_completed` 已经是 1，但 14:02 那次留下了铁证：
+
+```
+cmd: Can't find service: window
+```
+
+`window` 服务还没注册，`screencap` 必然失败，这就是 `BrokenPipeError`
+的来源。我原来只等 `boot_completed`，判据太弱。
+
+**2. 供电严重不足 —— 手机是被饿死的（根因）**
+
+```
+USB powered: true
+Max charging current: 500000   ← 500mA
+Max charging voltage: 5000000  ← 5V
+```
+
+板子 USB 口只给 **5V/0.5A = 2.5W**。12S Ultra 亮屏 + 跑 App + 投屏编码，
+功耗远超 2.5W。所以手机是**边充电边放电**，电量慢慢掉到 25%，
+电压撑不住就关机（14:26:43 掉线，14:27:24 以 05c6 回来）。
+
+这也解释了为什么之前几次成功、这次失败：**电量越低越容易触发**。
+
+**3. Airtest 截图没有超时（放大器）**
+
+`self._dev.snapshot()` → `Popen(...).communicate()`，**没有 timeout**。
+USB 一断管道就裂，抛 `BrokenPipeError`，而且死连接会被反复复用，
+3 次重试全撞在同一个坑上。
+
+### 修复
+
+**A. 真·就绪判据**（`airlib.system_ready`）
+
+不只是 `boot_completed`，还要：
+
+- `service check window` / `package` / `activity` 都在
+- `dumpsys window | grep mCurrentFocus` 有焦点窗口（不是 null）
+
+加 `wait_system_ready(settle=15)`：服务就绪后再稳 15 秒，
+避开首屏动画和资源加载。usbwatch 在跑流程前调用。
+
+**B. 截图自己控制超时**（`Phone._raw_screencap`）
+
+不再走 `self._dev.snapshot()`，改成 `subprocess.run(..., timeout=25)`
+直接 `adb exec-out screencap -p`，自己解码。断了就
+`_wait_device_back()`（最多 20s）+ `reconnect()` 再试一次。
+
+实测：设备消失时 **25.9 秒有界报错**，不再卡死。
+
+**C. 稳定期 15 秒**
+
+服务在了 ≠ UI 能点。
+
+### 修复后实测
+
+```
+14:32:22  启动时已插着，先跑一次
+14:32:37  系统就绪（等了 0s，另稳定 15s）
+14:33:14  流程结束：全部通过  36768ms  7/7 步通过
+          投屏 owner com.larus.nova ✓
+```
+
+比原来的 33.7 秒多了约 3 秒（稳定期），换来的是不会再撞未就绪的系统。
+
+### 但供电这一条代码修不了
+
+手机现在仍是 25% 电量、`Max charging current: 500mA`。
+**正确做法是给手机单独接充电器**，别指望板子的 USB 口。
+否则电量低的时候一定还会复现"跑到一半关机"。
+
+保底措施：跑流程前检查电量，低于阈值就先提示（见下）。
+
+## 保底：跑流程前查电量
+
+`usbwatch.py` 在跑流程前读一次电量，低于 `MIN_BATTERY`（默认 20）
+就跳过并记日志，避免把手机跑没电反而更麻烦。
+
+## 后续复核：供电没问题，投屏是被"上滑清理"杀的
+
+前一节我把 14:23 失败归因到"500mA 供电不足导致关机"。**这个结论是错的**，
+实测数据不支持。
+
+### 供电其实够
+
+连着 USB、投屏正在跑的情况下采样 5 次：
+
+```
+14:43:54  Charge counter 921mAh  level 25%  cast=owner com.larus.nova
+14:45:13  Charge counter 924mAh  level 26%  cast=owner com.larus.nova
+14:46:06  Charge counter 926mAh  level 26%  cast=owner com.larus.nova
+14:46:53  Charge counter 928mAh  level 26%  cast=owner com.larus.nova
+14:47:53  Charge counter 931mAh  level 26%  cast=none
+```
+
+**电量一直在涨**（约 1.4mAh/分钟）。500mA 是够用的。
+
+另一条反证：这次开机 `btime=1794493782`（14:29:42），连续运行 17 分钟没重启，
+`getprop ro.boot.bootreason` = `shutdown,userrequested`（人为关机）。
+
+### 投屏会被任务管理器清掉（真问题）
+
+投屏存活测试：7/7 通过后每 30 秒采样一次。
+
+```
+14:52:33  cast=owner com.larus.nova  pid=10953
+14:53:03  cast=owner com.larus.nova  pid=10953
+14:53:33  cast=owner com.larus.nova  pid=10953
+14:54:03  cast=owner com.larus.nova  pid=10953
+14:54:33  cast=owner com.larus.nova  pid=10953
+14:55:03  cast=owner com.larus.nova  pid=10953
+14:55:33  cast=owner com.larus.nova  pid=10953
+14:56:04  cast=NONE                   pid=DEAD     ← 约 3.5 分钟后没了
+```
+
+`logcat -b events` 里的真实原因：
+
+```
+22:55:40.984 ProcessSceneCleaner: SwipeUpClean: kill procName=com.android.settings
+22:55:43.943 ProcessSceneCleaner: SwipeUpClean: force-stop pkgName=com.larus.nova
+22:55:43.955 am_kill: [0,10953,com.larus.nova,200,stop due to SwipeUpClean]
+```
+
+**`SwipeUpClean` = 从最近任务上滑清理**。前面还有 `com.android.settings.
+Settings$AppNotificationSettingsActivity` 的痕迹，说明有人在手机上操作过。
+
+另有一种更隐蔽的：MIUI `SmartPower` 也会把后台的豆包判成 `hibernation`：
+
+```
+22:47:50 SmartPower: com.larus.nova/10231 state=hibernation adj=100
+22:47:53 SmartPower.com.larus.nova/10231(10949): background->idle(3008ms)
+```
+
+### 已做的缓解
+
+```
+adb shell dumpsys deviceidle whitelist +com.larus.nova   # 加 doze 白名单
+adb shell settings put global app_standby_enabled 0       # 关应用待机
+```
+
+doze 白名单不拦 MIUI 自己的 `ProcessSceneCleaner`。真要彻底防，得在
+手机侧给豆包设「无限制」+ 锁定后台，或者用 `am set-inactive` 反向标记。
+
+### 结论
+
+- **不是供电问题**，别为这个去改硬件（用户已决定改直供电，那是另一回事，更稳）。
+- **流程本身 7/7 稳定通过**，多次实测 32.8s / 32.9s / 33.1s / 35.7s。
+- 投屏能撑住的前提是**没人手动清理后台**。自动化本身不会去清。
+
+## 手机侧手动设置：防止豆包被系统清掉
+
+投屏能撑多久，取决于豆包进程活多久。板子侧无法完全管住这个，
+必须在**手机上手点一次**下面这些。小米 12S Ultra / MIUI（HyperOS）路径如下。
+
+包名：`com.larus.nova`（豆包 15.7.0）
+
+### 1. 省电策略设为「无限制」（最重要）
+
+设置 → 应用设置 → 应用管理 → 豆包 → **省电策略 → 无限制**
+
+这是治 `SmartPower` 把进程判成 `hibernation` 的那个问题。
+默认「智能限制」会在后台几秒后就把进程压到 idle。
+
+### 2. 锁定后台（防止上滑清理）
+
+打开豆包 → 进入最近任务（多任务界面）→ 长按豆包卡片 → 点**锁图标** 🔒
+
+治的是 `ProcessSceneCleaner: SwipeUpClean`。锁住之后上滑「清理全部」
+不会杀它。这一步只有手机能干，adb 改不了。
+
+### 3. 自启动 + 后台弹出界面
+
+设置 → 应用设置 → 应用管理 → 豆包 → **自启动**：打开
+同页面 → **其他权限** → 「后台弹出界面」「显示悬浮窗」：打开
+
+### 4. 电池优化白名单（已用 adb 代做）
+
+```
+adb shell dumpsys deviceidle whitelist +com.larus.nova
+adb shell settings put global app_standby_enabled 0
+adb shell cmd appops set com.larus.nova RUN_IN_BACKGROUND allow
+adb shell cmd appops set com.larus.nova RUN_ANY_IN_BACKGROUND allow
+adb shell am set-inactive com.larus.nova false
+```
+
+已执行并验证：
+
+```
+dumpsys deviceidle whitelist  →  user,com.larus.nova,10231
+RUN_IN_BACKGROUND             →  allow
+RUN_ANY_IN_BACKGROUND         →  allow
+am get-inactive               →  Idle=false
+```
+
+但**这几条管不住 MIUI 自己的 `ProcessSceneCleaner`**，所以第 1、2 步
+必须在手机上手动做。
+
+### 5. 关闭「锁屏后清理内存」
+
+设置 → 省电与电池 → 齿轮（右上角）→ **锁屏后清理内存 → 从不**
+
+### 验证方法
+
+设置完跑一次流程，然后每 30 秒采样：
+
+```bash
+adb -s 892e20c9 shell "dumpsys display | grep ScreenCapture" | grep -o "owner [a-z.]*"
+adb -s 892e20c9 shell "pidof com.larus.nova"
+```
+
+`owner com.larus.nova` 和 pid 同时存在超过 10 分钟，说明设置生效了。
+如果又出现 `SwipeUpClean`，用这条确认是哪种清理：
+
+```bash
+adb -s 892e20c9 shell "logcat -d -b events | grep -iE 'am_kill' | grep larus | tail -5"
+```
+
+### 补充：还有一种清理叫 OptimizationClean
+
+除了 `SwipeUpClean`（手动上滑），MIUI 还会主动做一次「优化清理」：
+
+```
+23:01:12.692 ProcessSceneCleaner: OptimizationClean: kill procName=com.xiaomi.security.onetrack
+23:01:12.694 ProcessSceneCleaner: OptimizationClean: kill procName=com.android.smspush
+23:01:12.694 ProcessSceneCleaner: OptimizationClean: kill procName=com.google.android.ext.services
+23:01:12.695 ProcessSceneCleaner: OptimizationClean: kill procName=com.android.permissioncontroller
+23:01:12.695 ProcessSceneCleaner: OptimizationClean: force-stop pkgName=com.larus.nova
+23:01:12.697 am_kill: [0,17227,com.larus.nova,200,stop due to OptimizationClean]
+```
+
+注意它**连系统组件一起杀**（`permissioncontroller`、`smspush`），所以这不是
+针对豆包的，是 MIUI 的一次批量清理。
+
+而且当时内存**一点都不紧张**：
+
+```
+MemTotal:       11444316 kB   (约 11GB)
+MemAvailable:    7055264 kB   (约 7GB 可用)
+```
+
+7GB 可用还触发清理，说明这是**定时/场景触发**的策略，不是内存不足导致。
+
+### 两种清理的区别与应对
+
+| 触发源 | 含义 | 怎么防 |
+|---|---|---|
+| `SwipeUpClean` | 用户在最近任务上滑清理 | 锁定后台任务（手机上点 🔒） |
+| `OptimizationClean` | MIUI 主动批量优化 | 省电策略→无限制 + 关「锁屏后清理内存」 |
+
+两者都可能导致投屏中断。第一种靠锁任务卡，第二种只能靠省电策略。
+
+### 重要：用户操作手机时不要跑自动化
+
+本次观测到，投屏被杀的那几次，手机前台都在变：
+
+```
+22:55:33  前台 = com.android.settings.Settings$AppNotificationSettingsActivity
+22:55:39  前台 = com.miui.home/.launcher.Launcher  (RecentsAnimation.onAnimationFinished)
+23:01:29  前台 = LauncherOverlayWindow:com.miui.personalassistant   (负一屏)
+23:01:29  前台 = com.android.quicksearchbox.SearchActivity
+```
+
+**结论：手机在被人工操作时，投屏必掉。** 自动化适合无人值守场景
+（手机放着、没人碰），不适合边用边跑。

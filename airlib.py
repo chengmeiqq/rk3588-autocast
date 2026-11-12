@@ -35,6 +35,7 @@ logging.getLogger("airtest").setLevel(logging.WARNING)
 warnings.filterwarnings("ignore", message=".*efficiency may be very low.*")
 
 import cv2  # noqa: E402
+import numpy as np  # noqa: E402
 
 def alive(serial, timeout=6):
     """这台设备现在真能用吗。
@@ -50,6 +51,72 @@ def alive(serial, timeout=6):
         return "ok" in (r.stdout or "")
     except Exception:
         return False
+
+
+def system_ready(serial, timeout=12):
+    """系统服务都注册好了吗。
+
+    sys.boot_completed=1 只说明"启动流程走完了"，system_server 的服务
+    可能还在陆续注册。实测踩过：boot_completed 已是 1，但
+    `screencap` 报 cmd: Can't find service: window —— 因为 window
+    服务还没上线。这时候截图/取焦点全废，流程必然失败。
+
+    所以要再加一道：window / package / activity 这些关键服务在，
+    且已经有窗口焦点。三个都满足才算真能用。
+    """
+    checks = [
+        ("window",   "service check window"),
+        ("package",  "service check package"),
+        ("activity", "service check activity"),
+    ]
+    for name, cmd in checks:
+        try:
+            r = subprocess.run(["adb", "-s", serial, "shell", cmd],
+                               capture_output=True, text=True, timeout=timeout)
+            out = (r.stdout or "").strip().lower()
+        except Exception:
+            return False, "%s 查询超时" % name
+        # `service check` 找不到会输出 "Service %s: not found"
+        if "not found" in out or "notfound" in out.replace(" ", ""):
+            return False, "%s 服务还没起来" % name
+    # 注意：不能把 mCurrentFocus=null 当成"没就绪"。
+    # 息屏 / 锁屏 / 刚开机时它本来就是 null —— 流程第 1 步 wake 就是为了
+    # 解决这个。这里只确认"能读到窗口信息"（dumpsys 有输出），
+    # 说明 window 服务真的在工作。
+    try:
+        r = subprocess.run(
+            ["adb", "-s", serial, "shell", "dumpsys window"],
+            capture_output=True, text=True, timeout=timeout)
+        out = r.stdout or ""
+    except Exception:
+        return False, "读窗口信息超时"
+    if "mCurrentFocus" not in out:
+        return False, "window 服务还没就绪（dumpsys 无焦点字段）"
+    return True, "OK"
+
+
+def wait_system_ready(serial, max_wait=180, settle=0):
+    """等系统真能用，再稳一会儿。
+
+    settle 秒是"稳定期"：服务注册完到 UI 真正响应之间还有一段，
+    开机后马上点会撞在动画/首屏加载上。
+    """
+    import time as _t
+    t0 = _t.monotonic()
+    last = 0.0
+    while _t.monotonic() - t0 < max_wait:
+        ok, why = system_ready(serial)
+        if ok:
+            el = _t.monotonic() - t0
+            if settle > 0:
+                _t.sleep(settle)
+            return True, "系统就绪（等了 %.0fs，另稳定 %.0fs）" % (el, settle)
+        el = _t.monotonic() - t0
+        if el - last >= 5:
+            print("  等系统就绪… %.0fs（%s）" % (el, why))
+            last = el
+        _t.sleep(1.5)
+    return False, "等系统就绪超时（%.0fs）" % max_wait
 
 
 def candidates():
@@ -181,14 +248,65 @@ class Phone(object):
         return self._dev.get_current_resolution()
 
     # ---------- 截图 / 找图 ----------
-    def snap(self, name=None):
-        """截当前屏，返回图像数组；给了 name 就存到 shots/ 下并返回路径。"""
-        img = self._dev.snapshot(quality=95)
-        if name:
-            path = name if os.path.isabs(name) else os.path.join(self.shot_dir, name)
-            cv2.imwrite(path, img)
-            return path
+    def _wait_device_back(self, max_wait=20):
+        """等 adb 重新看到这台设备。
+
+        USB 掉线后重连不是瞬间的事：内核要重新枚举，adbd 要重新起。
+        直接 reconnect() 只会拿到 device not ready。
+        """
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < max_wait:
+            if alive(self.serial, timeout=4):
+                return True
+            time.sleep(2)
+        return False
+
+    def _raw_screencap(self, timeout=25):
+        """自己发 screencap，而不是走 Airtest 的 snapshot()。
+
+        为什么不用 self._dev.snapshot()：它内部是 Popen(...).communicate()，
+        **没有超时**。USB 一断，管道直接裂，抛 BrokenPipeError，
+        而且那条死连接会被反复复用。这里自己控制超时，断了好重连。
+        """
+        r = subprocess.run(
+            ["adb", "-s", self.serial, "exec-out", "screencap", "-p"],
+            capture_output=True, timeout=timeout)
+        if r.returncode != 0 or not r.stdout:
+            err = (r.stderr or b"").decode("utf-8", "replace")[:200]
+            raise IOError("截图失败：%s" % (err or "空输出"))
+        buf = np.frombuffer(r.stdout, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            raise IOError("截图解码失败（%d 字节）" % len(r.stdout))
         return img
+
+    def snap(self, name=None, retries=2):
+        """截当前屏，返回图像数组；给了 name 就存到 shots/ 下并返回路径。
+
+        设备断了就重连再截。手机上 adbd 可能中途重启（USB 供电不足、
+        系统重启都会），不重连只会一直撞在死连接上。
+        """
+        last = None
+        for attempt in range(max(1, retries)):
+            try:
+                img = self._raw_screencap()
+                if name:
+                    path = name if os.path.isabs(name) else os.path.join(self.shot_dir, name)
+                    cv2.imwrite(path, img)
+                    return path
+                return img
+            except Exception as e:
+                last = e
+                if attempt + 1 >= retries:
+                    break
+                # 断连类错误才重连；解码错误重试也没意义，但也无妨
+                time.sleep(0.6)
+                self._wait_device_back()
+                try:
+                    self.reconnect()
+                except Exception:
+                    pass
+        raise last
 
     shot = snap
 
