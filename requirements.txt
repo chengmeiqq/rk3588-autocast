@@ -1,0 +1,7 @@
+# Airtest 官方包（图像识别 + 设备控制）
+airtest>=1.4.3
+# Web 控制面板
+Flask>=2.0
+# 图像处理
+opencv-python-headless>=4.5
+numpy>=1.20

@@ -1,0 +1,17 @@
+# 回到桌面
+key home
+sleep 1
+
+# 截一张图存档
+shot demo-home.png
+
+# 上滑一屏
+swipe up
+sleep 1
+
+# 点一下屏幕中间
+tap 540 1200
+sleep 1
+
+# 回桌面
+key home

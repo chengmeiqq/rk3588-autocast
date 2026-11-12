@@ -1,0 +1,314 @@
+#!/root/.openclaw/workspace/Airtest/.venv/bin/python
+# -*- coding: utf-8 -*-
+"""airctl - 一句话控制手机，不用写 Python。
+
+用法示例:
+  ./airctl tap 540 1200              点屏幕坐标
+  ./airctl tap --image btn.png       在屏幕上找图并点它
+  ./airctl swipe up                  上滑
+  ./airctl text hello                输入英文
+  ./airctl key home                  返回桌面 (home/back/enter/power/volup)
+  ./airctl open com.larus.nova       启动 App
+  ./airctl shot a.png                截图
+  ./airctl wait img.png 10           等图出现，最多 10 秒
+  ./airctl run macro.txt             执行文本宏
+"""
+from __future__ import print_function
+import os
+import sys
+import time
+
+os.environ.setdefault("ANDROID_HOME", "/usr/lib/android-sdk")
+os.environ["PATH"] = "/usr/lib/android-sdk/platform-tools:" + os.environ.get("PATH", "")
+
+from airtest.core.api import connect_device   # noqa: E402
+from airtest.aircv import imread, find_template  # noqa: E402
+
+import logging  # noqa: E402
+import warnings  # noqa: E402
+if not os.environ.get("AIR_VERBOSE"):
+    logging.getLogger("airtest").setLevel(logging.WARNING)
+    warnings.filterwarnings("ignore", message=".*efficiency may be very low.*")
+
+SERIAL = os.environ.get("AIR_SERIAL") or "892e20c9"
+SHOT_DIR = os.environ.get("AIR_SHOT_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "shots")
+KEYMAP = {
+    "home": "KEYCODE_HOME", "back": "KEYCODE_BACK", "enter": "KEYCODE_ENTER",
+    "power": "KEYCODE_POWER", "volup": "KEYCODE_VOLUME_UP", "voldown": "KEYCODE_VOLUME_DOWN",
+    "menu": "KEYCODE_MENU", "wakeup": "KEYCODE_WAKEUP", "sleep": "KEYCODE_SLEEP",
+    "delete": "KEYCODE_DEL", "tab": "KEYCODE_TAB", "search": "KEYCODE_SEARCH",
+}
+
+_dev = None
+
+
+def dev():
+    global _dev
+    if _dev is None:
+        _dev = connect_device(
+            "Android:///%s?cap_method=ADBCAP&touch_method=ADBTOUCH" % SERIAL)
+    return _dev
+
+
+def fail(msg, code=2):
+    sys.stderr.write("错误: %s\n" % msg)
+    sys.exit(code)
+
+
+def screen_path():
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    return os.path.join(SHOT_DIR, "_screen.png")
+
+
+def grab():
+    """截当前屏并返回 (路径, 图像数组)。"""
+    import cv2  # noqa: F401
+    from airtest.core.android.cap_methods.adbcap import AdbCap
+    d = dev()
+    img = d.snapshot(quality=90)
+    path = screen_path()
+    import cv2 as _cv
+    _cv.imwrite(path, img)
+    return path, imread(path)
+
+
+def resolve_img(name):
+    """把图片名解析成真实路径：绝对路径 / 当前目录 / shots 目录。"""
+    if os.path.isabs(name):
+        return name
+    for cand in (os.path.abspath(name), os.path.join(SHOT_DIR, name)):
+        if os.path.exists(cand):
+            return cand
+    return os.path.abspath(name)
+
+
+def find(img, threshold=0.75, timeout=0.0):
+    """在屏幕上找图，返回中心点坐标或 None。"""
+    pick = resolve_img(img)
+    if not os.path.exists(pick):
+        fail("找不到图片文件: %s" % pick)
+    tpl = imread(pick)
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        _, scr = grab()
+        hit = find_template(scr, tpl, threshold=threshold)
+        if hit:
+            return hit["result"], float(hit["confidence"])
+        if time.time() >= deadline:
+            return None, 0.0
+        time.sleep(0.5)
+
+
+def cmd_tap(args):
+    if args and args[0] == "--image":
+        if len(args) < 2:
+            fail("用法: tap --image 图片.png [阈值] [等待秒数]")
+        th = float(args[2]) if len(args) > 2 else 0.75
+        to = float(args[3]) if len(args) > 3 else 0.0
+        pt, conf = find(args[1], th, to)
+        if not pt:
+            fail("屏幕上没找到 %s (阈值 %.2f)" % (args[1], th), code=3)
+        print("找到 %s @ %s 置信度 %.2f" % (args[1], pt, conf))
+        dev().touch(pt)
+        return
+    if len(args) < 2:
+        fail("用法: tap X Y")
+    dev().touch((int(args[0]), int(args[1])))
+    print("点 (%s, %s)" % (args[0], args[1]))
+
+
+def cmd_swipe(args):
+    d = dev()
+    w, h = d.get_current_resolution()
+    if len(args) == 1 and args[0] in ("up", "down", "left", "right"):
+        cx, cy = int(w * 0.5), int(h * 0.5)
+        span = 0.3
+        if args[0] == "up":
+            p1, p2 = (cx, int(h * (0.5 + span))), (cx, int(h * (0.5 - span)))
+        elif args[0] == "down":
+            p1, p2 = (cx, int(h * (0.5 - span))), (cx, int(h * (0.5 + span)))
+        elif args[0] == "left":
+            p1, p2 = (int(w * (0.5 + span)), cy), (int(w * (0.5 - span)), cy)
+        else:
+            p1, p2 = (int(w * (0.5 - span)), cy), (int(w * (0.5 + span)), cy)
+    elif len(args) >= 4:
+        p1, p2 = (int(args[0]), int(args[1])), (int(args[2]), int(args[3]))
+    else:
+        fail("用法: swipe up|down|left|right  或  swipe X1 Y1 X2 Y2 [毫秒]")
+    dur = (int(args[4]) / 1000.0) if len(args) > 4 else 0.3
+    d.swipe(p1, p2, duration=dur)
+    print("滑动 %s -> %s" % (p1, p2))
+
+
+def cmd_text(args):
+    if not args:
+        fail("用法: text 要输入的文字（仅英文/数字，中文见 README）")
+    s = " ".join(args)
+    d = dev()
+    try:
+        d.text(s)
+        print("已输入: %s" % s)
+    except Exception:
+        os.system('"%s" shell input text %s' % (os.path.join(os.environ["ANDROID_HOME"],
+                  "platform-tools", "adb"), "'" + s.replace("'", "'\\''") + "'"))
+        print("已输入(adb): %s" % s)
+
+
+def cmd_key(args):
+    if not args:
+        fail("用法: key home|back|enter|power|volup|voldown|wakeup|sleep")
+    name = args[0].lower()
+    if name.isdigit():
+        dev().keyevent(int(name))
+        print("按键 %s" % name)
+        return
+    code = KEYMAP.get(name)
+    if not code:
+        fail("不认识的按键: %s（可用: %s）" % (name, ", ".join(sorted(KEYMAP))))
+    dev().keyevent(code)
+    print("按键 %s" % name)
+
+
+def cmd_open(args):
+    if not args:
+        fail("用法: open 包名，例如 open com.larus.nova")
+    pkg = args[0]
+    out = dev().shell("monkey -p %s -c android.intent.category.LAUNCHER 1" % pkg)
+    if "No activities found" in out:
+        fail("这个包名没有可启动的界面: %s" % pkg)
+    time.sleep(1.5)
+    cur = dev().shell("dumpsys window | grep mCurrentFocus")
+    print("已启动 %s" % pkg)
+    print(cur.strip()[:160])
+
+
+def cmd_shot(args):
+    name = args[0] if args else "shot_%s.png" % time.strftime("%H%M%S")
+    if not os.path.isabs(name):
+        os.makedirs(SHOT_DIR, exist_ok=True)
+        name = os.path.join(SHOT_DIR, name)
+    d = dev()
+    img = d.snapshot(quality=95)
+    import cv2
+    cv2.imwrite(name, img)
+    print(os.path.abspath(name))
+
+
+def cmd_wait(args):
+    if not args:
+        fail("用法: wait 图片.png [超时秒数] [阈值]")
+    to = float(args[1]) if len(args) > 1 else 10.0
+    th = float(args[2]) if len(args) > 2 else 0.75
+    t0 = time.time()
+    pt, conf = find(args[0], th, to)
+    if pt:
+        print("出现 %s @ %s 置信度 %.2f（等了 %.1fs）" % (args[0], pt, conf, time.time() - t0))
+    else:
+        fail("%.0fs 内没等到 %s" % (to, args[0]), code=3)
+
+
+def cmd_exists(args):
+    if not args:
+        fail("用法: exists 图片.png [阈值]")
+    th = float(args[1]) if len(args) > 1 else 0.75
+    pt, conf = find(args[0], th)
+    if pt:
+        print("YES %s %.2f" % (pt, conf))
+    else:
+        print("NO")
+        sys.exit(3)
+
+
+def cmd_sleep(args):
+    s = float(args[0]) if args else 1.0
+    time.sleep(s)
+
+
+def cmd_run(args):
+    if not args:
+        fail("用法: run 宏文件.txt")
+    path = args[0]
+    if not os.path.exists(path):
+        fail("找不到宏文件: %s" % path)
+    base = os.path.dirname(os.path.abspath(path))
+    n = 0
+    with open(path, "r") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            n += 1
+            parts = line.split()
+            cmd = parts[0].lower()
+            rest = parts[1:]
+            # 宏里的相对图片路径：先按宏文件目录找，再按当前目录找
+            def _res(x):
+                if not x.lower().endswith((".png", ".jpg")):
+                    return x
+                if os.path.isabs(x):
+                    return x
+                for cand in (os.path.join(base, x), os.path.abspath(x)):
+                    if os.path.exists(cand):
+                        return cand
+                return os.path.join(base, x)
+
+            rest = [_res(x) for x in rest]
+            print("[%02d] %s" % (n, line))
+            handler = COMMANDS.get(cmd)
+            if not handler:
+                fail("宏第 %d 行不认识: %s" % (n, cmd))
+            handler(rest)
+    print("宏执行完毕，共 %d 步" % n)
+
+
+def cmd_crop(args):
+    """截图并按区域裁出一张模板图：crop 名字.png x1 y1 x2 y2"""
+    if len(args) < 5:
+        fail("用法: crop 名字.png x1 y1 x2 y2   （截当前屏，裁这块存成模板）")
+    name, x1, y1, x2, y2 = args[0], int(args[1]), int(args[2]), int(args[3]), int(args[4])
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    full = os.path.join(SHOT_DIR, "_crop_src.png")
+    img = dev().snapshot(quality=95)
+    import cv2
+    cv2.imwrite(full, img)
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    patch = img[y1:y2, x1:x2]
+    if patch.size == 0:
+        fail("裁剪区域是空的，检查坐标")
+    out = name if os.path.isabs(name) else os.path.join(SHOT_DIR, name)
+    cv2.imwrite(out, patch)
+    print(os.path.abspath(out))
+    print("模板大小 %dx%d，中心点 (%d, %d)" % (patch.shape[1], patch.shape[0],
+                                          (x1 + x2) // 2, (y1 + y2) // 2))
+
+
+COMMANDS = {
+    "tap": cmd_tap, "swipe": cmd_swipe, "text": cmd_text, "key": cmd_key,
+    "open": cmd_open, "shot": cmd_shot, "screenshot": cmd_shot,
+    "wait": cmd_wait, "exists": cmd_exists, "sleep": cmd_sleep, "run": cmd_run,
+    "crop": cmd_crop,
+}
+
+USAGE = __doc__
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return
+    cmd = argv[0].lower()
+    if cmd == "devices":
+        from airtest.core.android.adb import ADB
+        print(ADB().devices())
+        return
+    handler = COMMANDS.get(cmd)
+    if not handler:
+        fail("不认识的命令: %s\n\n%s" % (cmd, USAGE))
+    handler(argv[1:])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="zh"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airtest 点哪儿</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --fg:#e8ebf2; --dim:#98a0b0;
+          --ok:#2ecc71; --bad:#ff6b60; --acc:#4a9eff; --warn:#f5a623; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:15px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  header { display:flex; align-items:center; gap:14px; padding:12px 18px;
+           border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:20; }
+  header h1 { font-size:16px; margin:0; font-weight:700; }
+  #status { color:var(--dim); font-size:12.5px; flex:1; }
+  .wrap { display:flex; gap:20px; padding:18px; align-items:flex-start; }
+  .left { flex:0 0 auto; position:relative; }
+  #screen { display:block; max-height:82vh; width:auto; border-radius:12px;
+            border:2px solid var(--line); cursor:crosshair; user-select:none; }
+  #screen.pick { border-color:var(--acc); box-shadow:0 0 0 3px rgba(74,158,255,.22); }
+  .panel { flex:1 1 400px; display:flex; flex-direction:column; gap:14px; max-width:480px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .step { display:flex; gap:10px; align-items:flex-start; margin-bottom:12px; }
+  .step .num { flex:0 0 26px; height:26px; border-radius:50%; background:var(--acc); color:#04121f;
+               font-weight:800; font-size:14px; display:flex; align-items:center; justify-content:center; }
+  .step .txt { flex:1; }
+  .step .txt b { color:#fff; }
+  .step .txt .sub { color:var(--dim); font-size:13px; }
+  .done .num { background:var(--ok); }
+  button { background:#252a34; color:var(--fg); border:1px solid var(--line); border-radius:9px;
+           padding:9px 14px; cursor:pointer; font-size:14px; font-family:inherit; }
+  button:hover { background:#2f3542; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#04121f; font-weight:700; }
+  button.primary:hover { background:#63aaff; }
+  button.go { background:var(--ok); border-color:var(--ok); color:#04200f; font-weight:700; }
+  button.go:hover { background:#4bdc8b; }
+  button.sm { padding:5px 10px; font-size:12.5px; border-radius:7px; }
+  button.danger { color:var(--bad); }
+  input[type=text], input[type=number] { background:#12151b; color:var(--fg);
+      border:1px solid var(--line); border-radius:8px; padding:9px 11px; font-size:14px; width:100%; font-family:inherit; }
+  input[type=text]:focus { outline:2px solid var(--acc); outline-offset:-1px; }
+  .row { display:flex; gap:9px; flex-wrap:wrap; align-items:center; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+  .hint { color:var(--dim); font-size:13px; }
+  .kbd { background:#0b0e13; border:1px solid var(--line); border-radius:5px; padding:1px 6px;
+         font-size:12.5px; color:#cfd6e4; }
+  #cropBox { display:none; }
+  #cropBox.on { display:block; }
+  #cropPrev { max-height:88px; max-width:150px; border-radius:6px; border:1px solid var(--line);
+              background:#000; object-fit:contain; }
+  .tpl { display:flex; align-items:center; gap:10px; padding:9px; border:1px solid var(--line);
+         border-radius:10px; margin-bottom:8px; background:#14171e; }
+  .tpl img { height:52px; max-width:92px; object-fit:contain; background:#000; border-radius:6px; }
+  .tpl .nm { flex:1; font-size:13px; word-break:break-all; color:#cfd6e4; }
+  .tpl .acts { display:flex; gap:6px; }
+  #log { font:12px/1.65 ui-monospace,Menlo,monospace; color:var(--dim); max-height:160px;
+         overflow:auto; white-space:pre-wrap; }
+  .logline.ok { color:var(--ok); } .logline.bad { color:var(--bad); }
+  #sel { position:absolute; border:2px dashed var(--acc); background:rgba(74,158,255,.16);
+         display:none; pointer-events:none; border-radius:3px; }
+  #toast { position:fixed; left:50%; bottom:28px; transform:translateX(-50%) translateY(20px);
+           background:#232935; border:1px solid var(--line); color:#fff; padding:11px 20px;
+           border-radius:10px; font-size:14px; opacity:0; transition:.22s; pointer-events:none;
+           box-shadow:0 8px 26px rgba(0,0,0,.5); z-index:60; max-width:80vw; }
+  #toast.on { opacity:1; transform:translateX(-50%) translateY(0); }
+  #toast.bad { border-color:var(--bad); }
+  #toast.ok { border-color:var(--ok); }
+  .help { display:none; } .help.on { display:block; }
+  #vcard { display:block; }
+  .shots { display:flex; gap:10px; align-items:center; }
+  .shots figure { margin:0; flex:1; text-align:center; }
+  .shots img { width:100%; border-radius:8px; border:1px solid var(--line); background:#000; }
+  .shots figcaption { font-size:12px; color:var(--dim); margin-top:5px; }
+  #vres { font-size:13.5px; margin-top:10px; padding:10px; border-radius:8px; line-height:1.55; }
+  #vres.ok { background:rgba(46,204,113,.12); border:1px solid rgba(46,204,113,.45); }
+  #vres.no { background:rgba(245,166,35,.12); border:1px solid rgba(245,166,35,.45); }
+
+  .help ol { margin:8px 0 0; padding-left:20px; } .help li { margin-bottom:6px; }
+</style>
+</head><body>
+<header>
+  <h1>Airtest 点哪儿</h1>
+  <span id="status">连接中…</span>
+  <label class="hint"><input type="checkbox" id="auto" checked> 自动刷新</label>
+  <button class="sm" onclick="refresh(true)">刷新画面</button>
+  <button class="sm" onclick="document.querySelector('.help').classList.toggle('on')">怎么用</button>
+</header>
+
+<div class="wrap">
+  <div class="left">
+    <img id="screen" src="/screen.jpg" alt="手机画面">
+    <div id="sel"></div>
+  </div>
+
+  <div class="panel">
+    <div class="card help">
+      <b>30 秒说明</b>
+      <ol>
+        <li>左边是你的手机屏幕，1 秒多刷新一次。</li>
+        <li><b>要让它点某个按钮</b>：在左边那块按钮上<b>按住鼠标拖一个框</b>圈住它，
+            松手后在右边起个名字，点"保存模板"。以后点"点它"就会自动找这个按钮并点。</li>
+        <li><b>只想点现在这个位置</b>：在画面上<b>单击一下</b>（不要拖动），就直接点那里。</li>
+        <li>找不到按钮时，把"相似度"调低一点（比如 0.65）。</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <div class="step" id="step1">
+        <div class="num">1</div>
+        <div class="txt">
+          <b>在左边画面上，把要点的东西圈起来</b>
+          <div class="sub">按住鼠标拖一个框，松手就出现在下面</div>
+        </div>
+      </div>
+
+      <div id="cropBox">
+        <div class="row" style="margin-bottom:10px">
+          <img id="cropPrev" alt="选区预览">
+          <div class="hint" id="cropInfo" style="flex:1"></div>
+        </div>
+        <input type="text" id="tplname" placeholder="给它起个名字，例如：发送按钮" style="margin-bottom:10px">
+        <div class="grid2">
+          <button class="primary" onclick="saveCrop(false)">保存模板</button>
+          <button class="go" onclick="saveCrop(true)">保存并点它</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="step" id="step2">
+        <div class="num">2</div>
+        <div class="txt">
+          <b>点"点它"，让它自己找并点</b>
+          <div class="sub">相似度越低越容易找到，但可能找错</div>
+        </div>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <span class="hint">相似度</span>
+        <input type="number" id="th" value="0.75" step="0.05" min="0.3" max="0.99" style="width:84px">
+        <label class="hint"><input type="checkbox" id="waitit"> 等它出现再点（最多10秒）</label>
+      </div>
+      <div id="tpls" class="hint">还没有模板</div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
+      <div class="row">
+        <input type="file" id="upfile" accept="image/*" style="font-size:12.5px;flex:1">
+        <button class="sm" onclick="uploadTpl()">上传现成图片当模板</button>
+      </div>
+    </div>
+
+    <div class="card" id="vcard">
+      <b style="font-size:13px;color:var(--dim)">验证：怎么确认真的点到了</b>
+      <div class="shots" style="margin-top:10px">
+      <div class="shots">
+        <figure><img id="vBefore" alt="点击前"><figcaption>点击前</figcaption></figure>
+        <figure><img id="vAfter" alt="点击后"><figcaption>点击后（红圈=点的位置）</figcaption></figure>
+      </div>
+      <div id="vres"></div>
+      <hr style="border:0;border-top:1px solid var(--line);margin:12px 0">
+      <b style="font-size:13px;color:var(--dim)">更硬的验证：是不是真的做成了</b>
+      <div class="hint" style="margin:6px 0 9px">填你期望看到的结果，点完它去核对。</div>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="expApp" placeholder="期望前台包名，如 com.larus.nova" style="flex:1">
+      </div>
+      <div class="row" style="margin-bottom:9px">
+        <input type="text" id="expText" placeholder="期望屏幕上出现的文字，如 发送" style="flex:1">
+      </div>
+      <div class="row">
+        <button class="sm primary" onclick="semCheck()">现在就核对</button>
+        <button class="sm" onclick="fillCurrent()">填入当前状态</button>
+      </div>
+      <div id="semres"></div>
+    </div>
+
+    <div class="card">
+      <div class="step" id="step4">
+        <div class="num">4</div>
+        <div class="txt">
+          <b>流程：一串动作，每步都验证</b>
+          <div class="sub">比如：启动豆包 → 点打电话 → 点投屏 → 点开始投屏</div>
+        </div>
+      </div>
+      <div id="steps" class="hint" style="margin-bottom:10px">还没有步骤。</div>
+      <div class="row" style="margin-bottom:9px">
+        <select id="addDo" style="flex:1;background:#12151b;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:9px">
+          <option value="open">启动 App</option>
+          <option value="tap_template">点模板</option>
+          <option value="tap_text">点文字（按屏幕文字）</option>
+          <option value="tap_xy">点坐标</option>
+          <option value="key">按键</option>
+          <option value="text">输入文字</option>
+          <option value="swipe">滑动</option>
+          <option value="sleep">等待</option>
+        </select>
+        <button class="sm" onclick="addStep()">加一步</button>
+      </div>
+      <div class="row" style="margin-bottom:9px">
+        <input type="text" id="flowName" placeholder="流程名，如 通话投屏" style="flex:1">
+        <button class="sm" onclick="saveFlow()">保存</button>
+      </div>
+      <div class="row">
+        <button class="go" onclick="runFlow()">▶ 运行并逐步验证</button>
+        <button class="sm" onclick="loadFlows()">刷新流程列表</button>
+      </div>
+      <div id="flowList" class="hint" style="margin-top:10px"></div>
+      <div id="flowRes" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <div class="step" id="step3">
+        <div class="num">3</div>
+        <div class="txt">
+          <b>其它操作</b>
+          <div class="sub">在画面上单击 = 直接点那个位置</div>
+        </div>
+      </div>
+      <div class="grid2">
+        <button onclick="act('swipe',{dir:'up'})">上滑</button>
+        <button onclick="act('swipe',{dir:'down'})">下滑</button>
+        <button onclick="act('key',{name:'home'})">回桌面</button>
+        <button onclick="act('key',{name:'back'})">返回</button>
+      </div>
+      <div class="row" style="margin-top:9px">
+        <input type="text" id="pkg" placeholder="包名，例如 com.larus.nova" style="flex:1">
+        <button onclick="act('open',{pkg:document.getElementById('pkg').value})">启动</button>
+      </div>
+      <div class="row" style="margin-top:9px">
+        <input type="text" id="txt" placeholder="要输入的文字" style="flex:1">
+        <button onclick="act('text',{text:document.getElementById('txt').value})">输入</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <b style="font-size:13px;color:var(--dim)">日志</b>
+        <button class="sm" onclick="document.getElementById('log').textContent=''">清空</button>
+      </div>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const img = document.getElementById('screen');
+const sel = document.getElementById('sel');
+let drag = null, crop = null;
+
+function toast(msg, kind) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'on ' + (kind || '');
+  clearTimeout(window._tt);
+  window._tt = setTimeout(() => { t.className = kind || ''; }, 2600);
+}
+
+function log(msg, kind) {
+  const el = document.getElementById('log');
+  const d = document.createElement('div');
+  d.className = 'logline ' + (kind || '');
+  d.textContent = new Date().toTimeString().slice(0,8) + '  ' + msg;
+  el.appendChild(d);
+  el.scrollTop = el.scrollHeight;
+}
+
+function refresh(force) {
+  img.src = '/screen.jpg?t=' + Date.now() + (force ? '&fresh=1' : '');
+}
+
+function relPos(e) {
+  const r = img.getBoundingClientRect();
+  return { fx: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+           fy: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)) };
+}
+
+img.addEventListener('mousedown', e => {
+  e.preventDefault();
+  drag = { start: relPos(e), moved: false };
+  sel.style.display = 'block';
+});
+
+img.addEventListener('mousemove', e => {
+  if (!drag) return;
+  const p = relPos(e);
+  if (Math.abs(p.fx - drag.start.fx) > 0.012 || Math.abs(p.fy - drag.start.fy) > 0.012) drag.moved = true;
+  drawSel(drag.start, p);
+});
+
+window.addEventListener('mouseup', async e => {
+  if (!drag) return;
+  const p = relPos(e), d = drag;
+  drag = null;
+  const moved = d.moved && Math.abs(p.fx-d.start.fx) > 0.012 && Math.abs(p.fy-d.start.fy) > 0.012;
+  if (moved) {
+    crop = { start: d.start, end: p };
+    drawSel(d.start, p);
+    showCrop(crop);
+  } else {
+    sel.style.display = 'none';
+    await act('tap_verify', { fx: p.fx, fy: p.fy });
+  }
+});
+
+function drawSel(a, b) {
+  const r = img.getBoundingClientRect();
+  const x1 = Math.min(a.fx,b.fx)*r.width, x2 = Math.max(a.fx,b.fx)*r.width;
+  const y1 = Math.min(a.fy,b.fy)*r.height, y2 = Math.max(a.fy,b.fy)*r.height;
+  sel.style.left = x1+'px'; sel.style.top = y1+'px';
+  sel.style.width = (x2-x1)+'px'; sel.style.height = (y2-y1)+'px';
+  sel.style.display = 'block';
+}
+
+function showCrop(c) {
+  document.getElementById('cropBox').classList.add('on');
+  // 从当前显示的画面里裁一块做预览
+  const cv = document.createElement('canvas');
+  const sx = Math.min(c.start.fx, c.end.fx) * img.naturalWidth;
+  const sy = Math.min(c.start.fy, c.end.fy) * img.naturalHeight;
+  const sw = Math.abs(c.end.fx - c.start.fx) * img.naturalWidth;
+  const sh = Math.abs(c.end.fy - c.start.fy) * img.naturalHeight;
+  cv.width = Math.max(1, sw); cv.height = Math.max(1, sh);
+  cv.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, cv.width, cv.height);
+  document.getElementById('cropPrev').src = cv.toDataURL();
+  document.getElementById('cropInfo').textContent =
+    `选区 ${Math.round(sw)}×${Math.round(sh)} 像素`;
+  const nm = document.getElementById('tplname');
+  if (!nm.value) nm.value = '按钮' + (document.querySelectorAll('.tpl').length + 1);
+  document.getElementById('step1').classList.add('done');
+  nm.focus(); nm.select();
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body||{})});
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || '失败');
+  return j;
+}
+
+async function act(kind, body) {
+  try {
+    const j = await post('/'+kind, body);
+    let msg = kind + ' 成功';
+    if (kind === 'tap') msg = `已点击 (${j.x}, ${j.y})  ${j.ms}ms`;
+    if (kind === 'tap_verify') {
+      msg = j.verify.changed
+        ? `已点击 (${j.x}, ${j.y})，画面有变化 ✓  ${j.ms}ms`
+        : `已点击 (${j.x}, ${j.y})，但画面没怎么变  ${j.ms}ms`;
+      showVerify(j.verify, `单击 (${j.x}, ${j.y})`);
+    }
+    if (kind === 'swipe') msg = '已滑动';
+    if (kind === 'key') msg = '已发送 ' + j.key;
+    if (kind === 'open') msg = '已启动';
+    if (kind === 'text') msg = '已输入';
+    log(msg, 'ok'); toast(msg, 'ok');
+    setTimeout(() => refresh(true), 260);
+  } catch (e) {
+    log(kind + ' 失败：' + e.message, 'bad'); toast(kind + ' 失败：' + e.message, 'bad');
+  }
+}
+
+async function saveCrop(alsoTap) {
+  if (!crop) return toast('先在左边画面上拖一个框', 'bad');
+  const name = document.getElementById('tplname').value.trim();
+  if (!name) return toast('先给它起个名字', 'bad');
+  try {
+    const j = await post('/crop', {name, fx1:crop.start.fx, fy1:crop.start.fy,
+                                   fx2:crop.end.fx, fy2:crop.end.fy});
+    log(`模板已保存：${j.name}（${j.w}×${j.h}）`, 'ok');
+    toast('已保存 ' + j.name, 'ok');
+    document.getElementById('tplname').value = '';
+    document.getElementById('cropBox').classList.remove('on');
+    sel.style.display = 'none';
+    crop = null;
+    await loadTpls();
+    if (alsoTap) await tapTpl(j.name);
+  } catch (e) {
+    log('保存失败：' + e.message, 'bad'); toast('保存失败：' + e.message, 'bad');
+  }
+}
+
+function showVerify(v, title) {
+  const card = document.getElementById('vcard');
+  card.classList.add('on');
+  document.getElementById('vBefore').src = '/proof/before.jpg?t=' + Date.now();
+  document.getElementById('vAfter').src = '/proof/after.jpg?t=' + Date.now();
+  const box = document.getElementById('vres');
+  let lines = [];
+  if (title) lines.push('<b>' + title + '</b>');
+  if (v.changed) {
+    box.className = 'ok';
+    lines.push('✅ <b>点击生效了</b>：画面发生了变化');
+  } else {
+    box.className = 'no';
+    lines.push('⚠️ <b>画面几乎没变</b>，可能：点空了 / 按钮本来无反应 / 需要更长的加载时间');
+  }
+  lines.push('整体像素差 ' + v.diff + '（>1.2 算有变化）');
+  if (v.local_diff !== undefined) lines.push('点击位置附近差异 ' + v.local_diff + '（>3 算有变化）');
+  if (v.changed_pct !== undefined) lines.push('明显变化的画面占比 ' + v.changed_pct + '%');
+  if (v.why) lines.push(v.why);
+  box.innerHTML = lines.join('<br>');
+}
+
+let flowSteps = [];
+
+function stepLabel(s) {
+  if (s.do === 'open') return '启动 ' + s.pkg;
+  if (s.do === 'tap_template') return '点模板 ' + s.name;
+  if (s.do === 'tap_text') return '点文字「' + s.text + '」';
+  if (s.do === 'tap_xy') return '点坐标 (' + s.fx + ',' + s.fy + ')';
+  if (s.do === 'key') return '按键 ' + s.name;
+  if (s.do === 'text') return '输入 ' + s.text;
+  if (s.do === 'swipe') return '滑动 ' + (s.dir || 'up');
+  if (s.do === 'sleep') return '等 ' + (s.seconds || 1) + 's';
+  return JSON.stringify(s);
+}
+
+function expectLabel(s) {
+  const parts = [];
+  if (s.expect_app) parts.push('前台=' + s.expect_app);
+  if (s.expect_text) parts.push('文字含「' + s.expect_text + '」');
+  if (s.expect_template) parts.push('出现 ' + s.expect_template);
+  if (s.expect_not_text) parts.push('消失「' + s.expect_not_text + '」');
+  return parts.length ? '  ⟹ 验：' + parts.join(' + ') : '  （不验证）';
+}
+
+function renderSteps() {
+  const box = document.getElementById('steps');
+  if (!flowSteps.length) {
+    box.innerHTML = '<span class="hint">还没有步骤。选上面的类型，点「加一步」。</span>';
+    return;
+  }
+  box.innerHTML = flowSteps.map((s, i) => `
+    <div class="tpl">
+      <span class="nm"><b>${i+1}.</b> ${stepLabel(s)}<br>
+        <span style="color:var(--warn);font-size:12px">${expectLabel(s)}</span></span>
+      <span class="acts">
+        <button class="sm" onclick="editStep(${i})">改</button>
+        <button class="sm danger" onclick="delStep(${i})">删</button>
+      </span>
+    </div>`).join('');
+}
+
+function addStep() {
+  const kind = document.getElementById('addDo').value;
+  const s = {do: kind, wait: 1.0};
+  if (kind === 'open') {
+    s.pkg = prompt('要启动的包名：', 'com.larus.nova');
+    if (!s.pkg) return;
+    s.expect_app = s.pkg;
+  } else if (kind === 'tap_template') {
+    s.name = prompt('点哪个模板？填完整文件名（可在上面列表看到）', '打电话.png');
+    if (!s.name) return;
+    const e = prompt('点完期望出现哪个模板？（留空=只验证点击，不验证结果）', '');
+    if (e) s.expect_template = e;
+  } else if (kind === 'tap_text') {
+    s.text = prompt('屏幕上要点的文字（如 立即开始）', '立即开始');
+    if (!s.text) return;
+    const e = prompt('点完期望出现什么文字？（留空不验证）', '正在共享屏幕');
+    if (e) s.expect_text = e;
+  } else if (kind === 'tap_xy') {
+    const fx = prompt('横向比例 0~1：', '0.5'); if (fx === null) return;
+    const fy = prompt('纵向比例 0~1：', '0.5'); if (fy === null) return;
+    s.fx = parseFloat(fx); s.fy = parseFloat(fy);
+  } else if (kind === 'key') {
+    s.name = prompt('按键名（home/back/enter/...）', 'home'); if (!s.name) return;
+  } else if (kind === 'text') {
+    s.text = prompt('要输入的文字', ''); if (!s.text) return;
+  } else if (kind === 'swipe') {
+    s.dir = prompt('方向 up/down/left/right', 'up'); if (!s.dir) return;
+  } else if (kind === 'sleep') {
+    s.seconds = parseFloat(prompt('等几秒', '1') || '1');
+  }
+  flowSteps.push(s);
+  renderSteps();
+}
+
+function editStep(i) {
+  const s = flowSteps[i];
+  const e = prompt('期望前台包名（留空不改）', s.expect_app || '');
+  if (e !== null && e !== '') s.expect_app = e;
+  const t = prompt('期望屏幕文字（留空不改）', s.expect_text || '');
+  if (t !== null && t !== '') s.expect_text = t;
+  const p = prompt('期望出现模板名（留空不改）', s.expect_template || '');
+  if (p !== null && p !== '') s.expect_template = p;
+  renderSteps();
+}
+
+function delStep(i) { flowSteps.splice(i, 1); renderSteps(); }
+
+async function saveFlow() {
+  const name = document.getElementById('flowName').value.trim();
+  if (!name) return toast('先给流程起个名字', 'bad');
+  if (!flowSteps.length) return toast('还没有步骤', 'bad');
+  const r = await fetch('/flow/save', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, steps: flowSteps})});
+  const j = await r.json();
+  if (!j.ok) return toast('保存失败：' + j.error, 'bad');
+  toast('已保存流程：' + name, 'ok');
+  loadFlows();
+}
+
+async function runFlow() {
+  if (!flowSteps.length) return toast('还没有步骤', 'bad');
+  const box = document.getElementById('flowRes');
+  box.innerHTML = '<div class="hint">正在跑，每步都要核对，请稍候…</div>';
+  try {
+    const r = await fetch('/flow/run', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({steps: flowSteps, stop_on_fail: true, tries: 8, interval: 0.8})});
+    const j = await r.json();
+    if (!j.ok) { box.innerHTML = '<div style="color:var(--bad)">' + j.error + '</div>'; return; }
+    let html = j.all_pass
+      ? '<div style="color:var(--ok);font-weight:700;margin-bottom:8px">全部通过 ✓  ' + j.done + '/' + j.total + ' 步，共 ' + j.ms + 'ms</div>'
+      : '<div style="color:var(--bad);font-weight:700;margin-bottom:8px">第 ' + (j.results.find(x=>x.aborted)||{i:'?'}).i + ' 步没通过 ✗</div>';
+    j.results.forEach(r => {
+      const mark = (r.action_ok && r.verify_ok !== false) ? '✅' : '❌';
+      html += `<div style="padding:7px 0;border-top:1px solid var(--line);font-size:13px">
+        ${mark} <b>${r.i}.</b> ${r.desc} <span style="color:var(--dim)">(${r.ms}ms)</span>`;
+      const v = r.verify || {};
+      (v.checks || []).forEach(c => {
+        const p = c.pass ? '✅' : '❌';
+        let det = c.kind === 'app' ? ('前台 ' + (c.actual || '未知'))
+                : c.kind === 'text' ? ('文字 ' + ((c.actual||[]).join('/') || '没看到'))
+                : ('模板 ' + (c.at ? ('在 ' + c.at.join(',') + ' 找到') : '没找到'));
+        html += `<div style="color:${c.pass?'var(--ok)':'var(--bad)'};padding-left:16px">${p} ${c.kind}：期望 ${c.expect} → ${det}</div>`;
+      });
+      if (v.skipped) html += `<div style="color:var(--dim);padding-left:16px">未设期望值，跳过验证</div>`;
+      html += '</div>';
+    });
+    box.innerHTML = html;
+    setTimeout(() => refresh(true), 300);
+  } catch (e) {
+    box.innerHTML = '<div style="color:var(--bad)">运行失败：' + e.message + '</div>';
+  }
+}
+
+async function loadFlows() {
+  const r = await fetch('/flows'); const j = await r.json();
+  const box = document.getElementById('flowList');
+  if (!j.flows.length) { box.innerHTML = '<span class="hint">还没有保存的流程</span>'; return; }
+  box.innerHTML = j.flows.map(f => `
+    <div class="tpl">
+      <span class="nm">${f.name}（${f.steps} 步）</span>
+      <span class="acts">
+        <button class="sm" onclick="useFlow('${f.file}')">载入</button>
+        <button class="sm danger" onclick="delFlow('${f.file}')">删</button>
+      </span>
+    </div>`).join('');
+}
+
+async function useFlow(file) {
+  const r = await fetch('/flow/' + encodeURIComponent(file));
+  const j = await r.json();
+  if (!j.ok) return toast('读取失败', 'bad');
+  flowSteps = j.flow.steps || [];
+  document.getElementById('flowName').value = j.flow.name || '';
+  renderSteps(); toast('已载入，可以改了', 'ok');
+}
+
+async function delFlow(file) {
+  await fetch('/flow/' + encodeURIComponent(file), {method:'DELETE'});
+  loadFlows(); toast('已删除');
+}
+
+async function semCheck() {
+  const app = document.getElementById('expApp').value.trim();
+  const txt = document.getElementById('expText').value.trim();
+  if (!app && !txt) return toast('先填期望的包名或文字', 'bad');
+  try {
+    const r = await fetch('/verify_after_tap', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({expect_app: app, expect_text: txt, wait: 1})});
+    const j = await r.json();
+    const box = document.getElementById('semres');
+    let lines = [];
+    if (!j.checks || !j.checks.length) lines.push('没填期望值');
+    (j.checks || []).forEach(c => {
+      if (c.kind === 'app') {
+        lines.push((c.pass ? '✅ ' : '❌ ') + '前台 App：期望 <b>' + c.expect +
+                   '</b>，实际 <b>' + (c.actual || '未知') + '</b>');
+      } else {
+        lines.push((c.pass ? '✅ ' : '❌ ') + '屏幕文字包含 <b>' + c.expect + '</b>' +
+                   (c.pass ? '' : '（没看到）'));
+      }
+    });
+    const pass = j.all_pass;
+    box.className = pass ? 'ok' : 'no';
+    box.style.cssText = 'font-size:13px;margin-top:9px;padding:9px;border-radius:8px;line-height:1.6';
+    box.innerHTML = lines.join('<br>');
+    log(pass ? '语义验证通过' : '语义验证未通过', pass ? 'ok' : 'bad');
+    toast(pass ? '验证通过：真的做成了' : '验证未通过：结果和预期不符', pass ? 'ok' : 'bad');
+  } catch (e) { toast('核对失败：' + e.message, 'bad'); }
+}
+
+async function fillCurrent() {
+  try {
+    const r = await fetch('/state'); const j = await r.json();
+    if (j.app) document.getElementById('expApp').value = j.app.split('/')[0];
+    toast('已填入当前前台 App', 'ok');
+  } catch (e) { toast('读取失败', 'bad'); }
+}
+
+async function loadTpls() {
+  const r = await fetch('/templates'); const j = await r.json();
+  const box = document.getElementById('tpls');
+  if (!j.templates.length) {
+    box.innerHTML = '<span class="hint">还没有模板。在左边圈一块，就能存成模板。</span>';
+    return;
+  }
+  box.innerHTML = j.templates.map(t => `
+    <div class="tpl">
+      <img src="/template/${encodeURIComponent(t.name)}?t=${t.mtime}" alt="">
+      <span class="nm">${t.name}</span>
+      <span class="acts">
+        <button class="go sm" onclick="tapTpl('${t.name.replace(/'/g,"\\'")}')">点它</button>
+        <button class="sm" onclick="findTpl('${t.name.replace(/'/g,"\\'")}')">试找</button>
+        <button class="sm danger" onclick="delTpl('${t.name.replace(/'/g,"\\'")}')">删</button>
+      </span>
+    </div>`).join('');
+}
+
+async function tapTpl(name) {
+  const th = parseFloat(document.getElementById('th').value) || 0.75;
+  const waitit = document.getElementById('waitit').checked;
+  toast('正在找 ' + name + ' …');
+  try {
+    const j = await post('/tap_template', {name, threshold: th, timeout: waitit ? 10 : 0});
+    const v = j.verify || {};
+    const msg = `找到并点击 ${name} → (${j.x}, ${j.y})  ${j.ms}ms`
+              + (v.changed ? ' 画面已变化 ✓' : ' 但画面没变');
+    log(msg, v.changed ? 'ok' : 'bad');
+    toast(v.changed ? '点击成功，画面已变化 ✓' : '点了但画面没变，可能没点中', v.changed ? 'ok' : 'bad');
+    showVerify(v, `模板 ${name} @ (${j.x}, ${j.y})`);
+    document.getElementById('step2').classList.add('done');
+    setTimeout(() => refresh(true), 260);
+  } catch (e) {
+    log(`没点到 ${name}：${e.message}`, 'bad');
+    toast(`屏幕上没找到 ${name}，把相似度调低试试`, 'bad');
+  }
+}
+
+async function findTpl(name) {
+  const th = parseFloat(document.getElementById('th').value) || 0.75;
+  try {
+    const j = await post('/find', {name, threshold: th});
+    log(`找到 ${name} 在 (${j.x}, ${j.y})`, 'ok'); toast(`找到了，在 (${j.x}, ${j.y})`, 'ok');
+  } catch (e) {
+    log(`没找到 ${name}（相似度 ${th}）`, 'bad'); toast(`没找到，把相似度调低点`, 'bad');
+  }
+}
+
+async function delTpl(name) {
+  await fetch('/templates/' + encodeURIComponent(name), {method:'DELETE'});
+  log('已删除 ' + name); loadTpls();
+}
+
+async function uploadTpl() {
+  const f = document.getElementById('upfile').files[0];
+  if (!f) return toast('先选一张图片', 'bad');
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/upload', {method:'POST', body: fd});
+  const j = await r.json();
+  if (j.ok) { log('上传成功：' + j.name, 'ok'); toast('上传成功', 'ok'); loadTpls(); }
+  else { log('上传失败：' + j.error, 'bad'); toast('上传失败', 'bad'); }
+}
+
+async function pollInfo() {
+  try {
+    const r = await fetch('/info'); const j = await r.json();
+    if (!j.ok) { document.getElementById('status').textContent = '手机未连接'; return; }
+    let app = (j.app || '');
+    const m = app.match(/mCurrentFocus=Window\{\S+ u0 ([\w.\/]+)/);
+    app = m ? m[1] : '';
+    document.getElementById('status').textContent =
+      `${j.serial} · ${j.resolution[0]}×${j.resolution[1]}` + (app ? ' · ' + app : '');
+  } catch (e) {
+    document.getElementById('status').textContent = '连接中…';
+  }
+}
+
+img.onload = () => {
+  if (!crop) return;
+  // 画面刷新后保持选区位置（比例不变，像素位置自动跟随）
+  drawSel(crop.start, crop.end);
+};
+
+setInterval(() => { if (document.getElementById('auto').checked) refresh(); }, 1300);
+setInterval(pollInfo, 5000);
+loadTpls(); pollInfo(); loadFlows(); renderSteps();
+</script>
+</body></html>

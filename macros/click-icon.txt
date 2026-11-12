@@ -1,0 +1,4 @@
+# 点桌面上的那个图标（用找图，坐标变了也不怕）
+key home
+sleep 1
+tap --image shots/btn.png

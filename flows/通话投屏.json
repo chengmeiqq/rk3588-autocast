@@ -1,0 +1,53 @@
+{
+  "name": "通话投屏",
+  "steps": [
+    {
+      "do": "wake",
+      "wait": 1
+    },
+    {
+      "do": "dismiss",
+      "dismiss_text": "USB 用于",
+      "dismiss_tries": 3,
+      "wait": 1,
+      "expect_not_text": "USB 用于"
+    },
+    {
+      "do": "open",
+      "pkg": "com.larus.nova",
+      "wait": 2,
+      "open_wait": 2.0,
+      "launch_timeout": 15,
+      "expect_app": "com.larus.nova"
+    },
+    {
+      "do": "tap_template",
+      "name": "打电话.png",
+      "threshold": 0.6,
+      "wait": 2.5,
+      "expect_template": "开启投屏.png",
+      "expect_threshold": 0.5
+    },
+    {
+      "do": "tap_template",
+      "name": "开启投屏.png",
+      "threshold": 0.5,
+      "wait": 2,
+      "expect_text": "立即开始"
+    },
+    {
+      "do": "tap_text",
+      "text": "立即开始",
+      "wait": 3,
+      "find_timeout": 10,
+      "expect_not_text": "立即开始",
+      "expect_text": "正在共享屏幕"
+    },
+    {
+      "do": "home",
+      "wait": 2,
+      "expect_app": "com.miui.home",
+      "expect_casting": true
+    }
+  ]
+}
