@@ -10,13 +10,14 @@ Flask 提供 web 控制面板，systemd 负责开机自启。
 
 ## 架构（2026-11-13 实测准入）
 
-三个常驻 systemd 服务，全部 `Restart=always`，均已 `enable`（开机自启）：
+四个常驻 systemd 服务，全部 `Restart=always`，均已 `enable`（开机自启）：
 
 | 服务 | 端口 | 作用 |
 |---|---|---|
 | `airtest-adbd` | — | 管 adb 通道：USB 优先，掉了自动切 WiFi `192.168.1.119:5555` |
 | `airtest-smartcast` | 8130 | 窄 HTTP 接口：`POST /cast`、`/step/*`、`/status` |
 | `airtest-keepcast` | — | **投屏守护**：掉线自动重拉 + USB 框监视 + Tasker 存活监视 |
+| `airtest-lenscast` | — | **全镜直播守护**：插 USB 自动开播 4K / 对焦 1.53 / 质量 100% |
 
 另有一次性 `airtest-postboot-check`（`Type=oneshot`，开机 45 秒后写自检日志到
 `logs/postboot_check.log`），用来事后核对开机是否一切正常。
@@ -37,6 +38,43 @@ Flask 提供 web 控制面板，systemd 负责开机自启。
 
 三条线都先过同一道门：`state/keepcast.pause` 存在 → 不动手；
 USB 设备节点不在（读 sysfs，不发 adb）→ 待命。**拔了线就完全不碰手机。**
+
+### 全镜直播（LensCast）守护
+
+`lenscast_keep.py`，同样是「插着 USB 才干活」，拔线完全不动。
+
+**为什么走 HTTP API 而不用点击**：App 自带 Web 控制台（41737），参数全在
+`/api/control` 上，改完能用 `/api/state` 回读确认。点界面要处理滚动、滑块
+坐标、下拉框选中态，UI 一改全废；API 是结构化的，失败立刻可见。
+
+**为什么用 `adb forward` 而不是手机 IP**：手机 IP 是 DHCP 的（本次
+`192.168.1.119`），换网段就断。`adb forward tcp:41737 tcp:41737` 让板子的
+`127.0.0.1:41737` 直通手机，插上就一定通。
+
+目标参数（`WANT` 常量，改这里就是改目标）：
+
+| 参数 | 值 | API |
+|---|---|---|
+| 摄像头 | 后摄 3 | `camera=0` |
+| 分辨率 | 3840x2160 | `resolution=3840x2160` |
+| 推流质量 | 100% | `quality=100` |
+| 对焦 | 1.53 | `focus=manual` 后 `focusDistance=1.53` |
+| 开始直播 | — | `streaming=true` |
+
+三个踩过的坑，都写进代码注释了：
+
+1. **参数名是 `focus` 不是 `focusMode`**。传 `focusMode=manual` 会返回
+   `{"ok":true}` 但静默不生效，`focusDistanceSupported` 一直是 `false`，
+   对焦永远设不上。真正生效的是 `focus=manual`（见 `dashboard.js` 的
+   `params.set('focus', ...)`）。
+2. **切 manual 后必须重读 state**。auto 模式下 App 不报 `focusDistanceValue`，
+   拿旧对象判空会以为「值已经对了」。
+3. **4K@100% 时 App 的 HTTP 服务会死锁**。实测连续 70 秒零响应，手机本地
+   loopback 也不通，CPU 却是 0%——是服务线程卡死，不是负载。进程还活着、
+   端口还 LISTEN，所以「进程在」不能当健康判据，必须真抓一帧。
+
+健康判据：state 里五项参数对上 + `streaming=true` + 抓帧 ≥ 20KB。
+抓帧走 `/snapshot.jpg` 的 302 跳转（不跟随就只拿到空 body）。
 
 ### 为什么是「双判据」而不是看进程
 
@@ -89,6 +127,9 @@ MIUI 的 `com.android.settings/.connecteddevice.usb.UsbModeChooserReceiver`
 airweb.py        Flask 服务：流程执行 + 截图 + 状态（端口 8123）
 adbd.py          adb 通道管理：USB 优先，断了切 WiFi
 keepcast.py      投屏守护：主循环 + USB 框监视 + Tasker 存活监视
+lenscast_keep.py 全镜直播守护：插 USB 自动开播 4K/对焦1.53/质量100%
+scripts/probe_lens.py      逐个镜头探测：能否开流 + 能否出 4K 帧
+scripts/taskerd.sh         手机侧 Tasker 守护（Magisk service.d，见下）
 scripts/postboot_check.sh  开机后自检（写 logs/postboot_check.log）
 airlib.py        Airtest 封装：连接、找模板、点击、等待
 usbwatch.py      盯 USB 口（读 /sys，不依赖 adb/网络），插上就跑

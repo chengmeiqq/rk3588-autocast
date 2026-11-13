@@ -1,0 +1,18 @@
+[Unit]
+Description=Airtest 全镜直播守护（插 USB 自动开播 4K/对焦1.53/质量100）
+After=network-online.target airtest-adbd.service
+Wants=airtest-adbd.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/Airtest
+Environment=ANDROID_HOME=/usr/lib/android-sdk
+Environment=PATH=/usr/lib/android-sdk/platform-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LENS_INTERVAL=30
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/.openclaw/workspace/Airtest/.venv/bin/python ./lenscast_keep.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
