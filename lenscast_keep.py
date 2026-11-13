@@ -44,6 +44,8 @@ STATE = os.path.join(STATE_DIR, "lenscast.json")
 PAUSE = os.path.join(STATE_DIR, "lenscast.pause")
 
 import gate  # 总开关（state/allow.json）
+import smartcast  # 只为了 casting_owner()：判断投屏是否已建立
+import arb  # 前台仲裁：跟 keepcast 轮流用前台，不挨着动手
 
 # keepcast 跑投屏流程时会锁住这个文件（smartcast.CAST_LOCK）。
 # 拿到锁 = 没人投屏；拿不到 = 正在投屏。
@@ -338,6 +340,14 @@ def apply_params(st):
 
 def bring_up(serial):
     """把直播拉起来。返回 (ok, note)。"""
+    # 投屏流程正在走（点共享屏幕 → 系统授权弹窗 → 点立即开始）时，
+    # 这里任何一步都会把前台抢过来：start_app 直接切走，apply_params
+    # 和 ctl(streaming) 也会把 App 顶到前面。授权弹窗被切走，
+    # keepcast 下一刀就点在空气上——实测反复出现，投屏永远起不来。
+    # 所以入口直接让路，等它跑完再说。
+    if cast_in_progress() and not smartcast.casting_owner(serial):
+        return False, "投屏流程进行中，本轮让路（不抢前台）"
+
     if not app_alive(serial):
         log("全镜直播没在跑，拉起")
         start_app(serial)
@@ -428,12 +438,15 @@ def main():
                             # 投屏正在走授权流程，前台是豆包属于正常现象，
                             # 这时候顶回直播画面会打断授权弹窗。让路。
                             log("投屏流程进行中（前台 %s），本次不顶前台，让路" % (fg or "未知"))
-                        else:
+                        elif arb.wait_turn("lenscast", log=log):
                             was = fg or "未知"
+                            arb.touch("lenscast", "顶回直播画面")
                             bring_to_front(serial)
                             time.sleep(2)
                             fg = foreground(serial)
                             log("直播画面被切到后台（前台原来是 %s），已顶回前台" % was)
+                        else:
+                            log("另一个守护刚动过手，本轮不顶（下轮再来）")
                     if last_ok != "healthy":
                         log("直播正常（%s %s 帧%dKB）" % (
                             st.get("selectedCameraLabel"), st.get("selectedResolution"),
@@ -455,13 +468,22 @@ def main():
                 log(note)
                 # 新拉起的进程默认在前台，但 keepcast 可能刚按过 HOME，
                 # 这里补一刀确保画面落在豆包看得见的位置。
-                if PKG not in foreground(serial) and not cast_in_progress():
+                if (PKG not in foreground(serial) and not cast_in_progress()
+                        and arb.wait_turn("lenscast", log=log)):
+                    arb.touch("lenscast", "拉起后切前台")
                     bring_to_front(serial)
                     log("已把直播画面切到前台")
                 last_ok = "healthy"
                 fails = 0
                 save_state(ok=True, serial=serial, note=note, why="")
                 time.sleep(CHECK_EVERY)
+                continue
+
+            if "投屏流程进行中" in note:
+                # 让路不是故障：不计失败，也不写"未能拉起"，否则日志
+                # 看着像出问题，实际上是我们主动躲开。
+                last_ok = "yield"
+                time.sleep(10)
                 continue
 
             fails += 1

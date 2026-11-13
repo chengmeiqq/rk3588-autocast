@@ -42,6 +42,7 @@ STATE = os.path.join(STATE_DIR, "keepcast.json")
 PAUSE = os.path.join(STATE_DIR, "keepcast.pause")
 
 import gate  # 总开关（state/allow.json）
+import arb  # 前台仲裁：跟 lenscast 轮流用前台，不挨着动手
 LOG = os.path.join(HERE, "logs", "keepcast.log")
 
 ADB = "/usr/lib/android-sdk/platform-tools/adb"
@@ -521,6 +522,14 @@ def main():
                 % ("、".join(why), owner, pid))
             started_at = 0.0
 
+            # 动手前先看轮次：lenscast 刚把直播顶到前台的话，等它停手再点，
+            # 否则点「共享屏幕」的瞬间画面就被切走，点在空气上。
+            if not arb.wait_turn("keepcast", log=log):
+                was_ok = False
+                time.sleep(CHECK_EVERY)
+                continue
+
+            arb.touch("keepcast", "发起投屏流程")
             r = run_locked(serial)
             if r is None:
                 log("已有别的投屏流程在跑，本轮让路")

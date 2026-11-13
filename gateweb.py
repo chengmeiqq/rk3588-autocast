@@ -32,6 +32,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import gate  # noqa: E402
+import arb  # 前台仲裁状态
 
 app = Flask(__name__)
 
@@ -111,7 +112,11 @@ PAGE = """<!doctype html>
   <button onclick="load()">刷新</button>
 </div>
 <div id="note"></div>
+<div id="arb" class="arb"></div>
 
+<style>
+.arb{font-size:12px;color:#7a8595;margin:10px 0 4px;line-height:1.6}
+</style>
 <div class="foot">
   暂停是「就地让路」：服务进程不退出，只是每轮跳过动作，按一下 1 秒内生效。<br>
   恢复后不需要重启服务。参数调节在 <code>手机IP:41737</code>。
@@ -136,6 +141,21 @@ function render(s) {
     ? '四个守护都在按规则自动接管'
     : (s.note ? '已暂停 · ' + s.note : '已暂停，守护不会动手');
   document.getElementById('mSw').disabled = busy;
+
+  // 前台仲裁：两个守护轮流用前台，这里显示谁刚动过手。
+  const arbBox = document.getElementById('arb');
+  if (arbBox && s.arb) {
+    const g = s.arb.gap_seconds;
+    const parts = [];
+    for (const [k, v] of Object.entries(s.arb.daemons || {})) {
+      if (v.since === null || v.since === undefined) {
+        parts.push(k + '：还没动过');
+      } else {
+        parts.push(k + '：' + v.since.toFixed(0) + ' 秒前' + (v.what ? '（' + v.what + '）' : ''));
+      }
+    }
+    arbBox.textContent = '前台间隔 ' + g + ' 秒 · ' + parts.join(' · ');
+  }
 
   const list = document.getElementById('list');
   list.innerHTML = '';
@@ -220,6 +240,12 @@ def build_status():
         # 服务没在跑的话，开关显示成灰的更有意义
         s["daemons"][ident]["running"] = st == "active"
     s["at_now"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    # 前台仲裁：谁刚动过前台、隔了多久。两个守护就是靠这个错开的，
+    # 放在页面上才看得出"它们到底在轮什么"。
+    try:
+        s["arb"] = arb.status()
+    except Exception as e:
+        s["arb"] = {"error": str(e)[:80]}
     return s
 
 
