@@ -37,6 +37,46 @@ RAW = "/tmp/_cast_raw.png"
 HOME_TPL = "打电话.png"      # 首页底部那颗电话
 CAST_TPL = "开启投屏.png"    # 通话页底部那颗投屏
 
+# adb 用绝对路径：systemd 起的服务 PATH 里没有 platform-tools。
+ADB = "/usr/lib/android-sdk/platform-tools/adb"
+
+
+def pick_serial():
+    """挑一个真能用的设备。
+
+    为什么不能写死 892e20c9：
+      手机靠板子 USB 供电，实测会出现「重新枚举」——同一个物理口，
+      设备从 2717:ff48（MTP+ADB）变成 2717:ff40（纯 MTP，无 adb 接口），
+      `adb devices` 直接空，所有接口 500。
+
+    所以现在两条腿都要认：
+      - USB：序列号 892e20c9
+      - WiFi：192.168.1.119:5555
+    优先 USB（快），不通就换 WiFi。都不通返回环境变量/默认值，
+    让调用方自己报"手机没连上 adb"。
+    """
+    usb = os.environ.get("PHONE_SERIAL", "892e20c9")
+    wifi = os.environ.get("PHONE_WIFI", "192.168.1.119:5555")
+    forced = os.environ.get("PHONE_FORCE")     # 想固定某个就设它
+    if forced:
+        return forced
+    try:
+        p = subprocess.run([ADB, "devices"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=12)
+        states = {}
+        for line in p.stdout.decode("utf-8", "replace").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] in ("device", "offline"):
+                states[parts[0]] = parts[1]
+    except Exception:
+        return usb
+    if states.get(usb) == "device":
+        return usb
+    if states.get(wifi) == "device":
+        return wifi
+    # 状态是 offline 的也别用
+    return usb
+
 SYSTEM = """你在操作一台安卓手机，目标是让豆包App开始屏幕共享。
 屏幕 1080x2400，坐标原点左上角，x 向右、y 向下。
 图上画了坐标网格：红竖线是 x、绿横线是 y，线上数字就是真实像素坐标，
@@ -63,7 +103,7 @@ def _cfg():
 
 def _adb(serial, *args, timeout=25):
     try:
-        return subprocess.run(["adb", "-s", serial] + list(args),
+        return subprocess.run([ADB, "-s", serial] + list(args),
                               capture_output=True, text=True,
                               timeout=timeout).stdout or ""
     except Exception:
@@ -243,85 +283,124 @@ def casting_owner(serial):
 
 
 def _enter_call(serial, step):
-    """从当前界面走到豆包通话页。模板优先，模板摸不到就问模型。"""
-    headless_backs = 0
+    """从当前界面走到豆包通话页。
+
+    定位方式按精确度排优先级，能用贵的不省：
+      1. 无障碍树按名字找（系统报的，像素级准确）
+      2. 模板匹配（无障碍树是空的时候兜底）
+      3. 视觉模型（前两个都没有，且坐标必须落在真实节点内）
+
+    绝不"大概位置点一下"。找不到就不点，宁可重启重来。
+    """
+    import uitap
+
+    def in_call():
+        return "RealtimeCall" in foreground(serial)
+
+    if in_call():
+        return True
+
+    NAME = "打电话"
     for i in range(1, 4):
-        grab(serial, grid=False)
-        hit = find_tpl(HOME_TPL, 0.6)
+        # ── 1. 无障碍树 ──
+        ns = uitap.dump(serial)
+        hit = uitap.find(ns, NAME)
         if hit:
-            tap_xy(serial, hit[0], hit[1])
-            step("第%d轮：模板命中「打电话」@(%d,%d) 分数 %.3f"
-                 % (i, hit[0], hit[1], hit[2]))
+            n = hit[0]
+            step("第%d轮：无障碍树找到「%s」@(%d,%d) bounds=%s"
+                 % (i, NAME, n["cx"], n["cy"], n["bounds"]))
+            uitap.tap_node(serial, n)
         else:
-            if headless_backs < 1:
-                _restart_home(serial)
-                headless_backs += 1
-                step("第%d轮：模板没命中，重启豆包回首页" % i)
-                time.sleep(1.5)
-                continue
-            img = grab(serial, grid=True)
-            if not img:
-                step("第%d轮：截不到图" % i)
-                time.sleep(2)
-                continue
-            a, raw = ask(img, "屏幕上没有「打电话」按钮。当前是什么页面？"
-                              "该 back 退回首页还是已经可以点别的？")
-            if not a:
-                step("第%d轮：模型没答好（%s）" % (i, raw[:50]))
-                time.sleep(1.5)
-                continue
-            step("第%d轮：模型判断 page=%s(%s)"
-                 % (i, a.get("page"), a.get("what", "")[:40]))
-            if a.get("action") == "tap" and a.get("page") == "home":
-                mx, my = int(a.get("x", 0)), int(a.get("y", 0))
-                ok_pt = False
-                for nm in (HOME_TPL, "视频通话.png"):
-                    chk = find_tpl(nm, 0.5)
-                    if chk and abs(chk[0] - mx) <= 130 and abs(chk[1] - my) <= 130:
-                        mx, my, ok_pt = chk[0], chk[1], True
-                        break
-                if not ok_pt:
-                    step("第%d轮：模型点位 (%d,%d) 没有对应按钮，重启" % (i, mx, my))
+            # ── 2. 模板兜底 ──
+            grab(serial, grid=False)
+            tpl = find_tpl(HOME_TPL, 0.6)
+            if tpl:
+                tap_xy(serial, tpl[0], tpl[1])
+                step("第%d轮：无障碍树没有名字，模板命中 @(%d,%d) %.3f"
+                     % (i, tpl[0], tpl[1], tpl[2]))
+            else:
+                # ── 3. 模型兜底，坐标必须落在真实可点节点内 ──
+                img = grab(serial, grid=True)
+                a, raw = (None, "")
+                if img:
+                    a, raw = ask(img, "屏幕上没有「打电话」按钮。当前是什么页面？"
+                                      "该 back 退回首页还是已经可以点别的？")
+                if not a:
+                    step("第%d轮：无障碍树空、模板没命中、模型没答好（%s）"
+                         % (i, (raw or "")[:40]))
                     _restart_home(serial)
-                    headless_backs += 1
                     time.sleep(1.5)
                     continue
-                x, y = tap_xy(serial, mx, my)
-                step("按模型点位（已核对）@(%d,%d)" % (x, y))
-            else:
-                _restart_home(serial)
-                headless_backs += 1
-                step("按模型判断重启回首页")
-                time.sleep(1.5)
-                continue
+                if a.get("action") == "tap":
+                    mx, my = int(a.get("x", 0)), int(a.get("y", 0))
+                    # 硬约束：模型点必须落在某个真实且可点的节点里
+                    inside = [n for n in uitap.dump(serial)
+                              if n["clickable"] and n["enabled"]
+                              and n["bounds"][0] <= mx <= n["bounds"][2]
+                              and n["bounds"][1] <= my <= n["bounds"][3]]
+                    if inside:
+                        inside.sort(key=lambda n: n["area"])
+                        n = inside[0]
+                        step("第%d轮：模型点位 (%d,%d) 落在节点「%s」内，改点该节点中心"
+                             % (i, mx, my, (n["text"] or n["desc"])[:20]))
+                        uitap.tap_node(serial, n)
+                    else:
+                        step("第%d轮：模型点位 (%d,%d) 不在任何可点节点内，拒绝点击"
+                             % (i, mx, my))
+                        _restart_home(serial)
+                        time.sleep(1.5)
+                        continue
+                else:
+                    step("第%d轮：模型判断 page=%s，重启回首页"
+                         % (i, a.get("page")))
+                    _restart_home(serial)
+                    time.sleep(1.5)
+                    continue
 
         for _ in range(12):
             time.sleep(0.8)
-            if "RealtimeCall" in foreground(serial):
+            if in_call():
                 return True
-        if "RealtimeCall" in foreground(serial):
-            return True
-    return "RealtimeCall" in foreground(serial)
+    return in_call()
 
 
 def _open_cast(serial, step, wait_secs=16.0):
-    """在通话页把投屏打开。点过图标就只等结果，绝不再点第二次。"""
+    """在通话页把投屏打开。
+
+    「共享屏幕」是豆包给这颗按钮的无障碍描述（实测确认）。
+    用名字找而不是看图，好处是：
+      - 图标换了样子也能找到
+      - 找的是"共享屏幕"，绝不会误点成"挂断通话"（两者挨着）
+      - 找到就直接点它自己的中心坐标
+
+    点过之后只等结果，绝不再点第二次：万一状态已经变了，
+    同一个位置可能变成「停止投屏」，点下去会把投屏关掉。
+    """
+    import uitap
+
     if casting_owner(serial):
         return casting_owner(serial)
 
-    hit = None
-    for _ in range(8):          # 图标有时要几秒才绘制出来
-        grab(serial, grid=False)
-        hit = find_tpl(CAST_TPL, 0.5)
+    # 界面上如果已经有「停止投屏」，说明开着，别再点
+    if uitap.find(uitap.dump(serial), "停止共享", "停止投屏"):
+        step("界面上是「停止投屏」，说明已经在投，不动")
+        return casting_owner(serial) or "already"
+
+    clicked = False
+    for i in range(1, 9):          # 图标有时要几秒才绘制出来
+        ns = uitap.dump(serial)
+        hit = uitap.find(ns, "共享屏幕") or uitap.find(ns, "投屏")
         if hit:
+            n = hit[0]
+            step("第%d次：无障碍树找到「共享屏幕」@(%d,%d) bounds=%s"
+                 % (i, n["cx"], n["cy"], n["bounds"]))
+            uitap.tap_node(serial, n)
+            clicked = True
             break
         time.sleep(1)
 
-    if hit:
-        tap_xy(serial, hit[0], hit[1])
-        step("模板命中「开启投屏」@(%d,%d) 分数 %.3f"
-             % (hit[0], hit[1], hit[2]))
-    else:
+    if not clicked:
+        # 无障碍树里真没有（自绘界面）。模型给的坐标必须落在真实可点节点内。
         img = grab(serial, grid=True)
         if not img:
             step("截不到图")
@@ -329,11 +408,22 @@ def _open_cast(serial, step, wait_secs=16.0):
         a, raw = ask(img, "这是通话页。请找到底部的投屏图标（一个方框里带向上箭头的"
                           "小图标），给出它的中心坐标。找不到就 action=fail。")
         if not a or a.get("action") != "tap":
-            step("模型也没定位到投屏图标（%s）"
+            step("无障碍树和模型都没定位到投屏图标（%s）"
                  % ((raw or "")[:50] if not a else a.get("what", "")[:40]))
             return ""
-        x, y = tap_xy(serial, a.get("x", 0), a.get("y", 0))
-        step("按模型点位点投屏 @(%d,%d)" % (x, y))
+        mx, my = int(a.get("x", 0)), int(a.get("y", 0))
+        inside = [n for n in uitap.dump(serial)
+                  if n["clickable"] and n["enabled"]
+                  and n["bounds"][0] <= mx <= n["bounds"][2]
+                  and n["bounds"][1] <= my <= n["bounds"][3]]
+        if not inside:
+            step("模型点位 (%d,%d) 不在任何可点节点内，拒绝点击" % (mx, my))
+            return ""
+        inside.sort(key=lambda n: n["area"])
+        n = inside[0]
+        step("模型点位 (%d,%d) 落在节点「%s」内，改点其中心 @(%d,%d)"
+             % (mx, my, (n["text"] or n["desc"])[:20], n["cx"], n["cy"]))
+        uitap.tap_node(serial, n)
 
     # 只等，不再点图标。权限框有时要好几秒才出来。
     import time as _t
@@ -342,22 +432,54 @@ def _open_cast(serial, step, wait_secs=16.0):
         owner = casting_owner(serial)
         if owner:
             return owner
-        got = tap_text(serial, "立即开始")
+        # 授权框按钮文案实测是「立即开始」
+        got = uitap.click(serial, "立即开始", wait=0.8)
         if got:
-            step("点「立即开始」授权 @(%d,%d)" % got)
+            step("点「立即开始」授权 @(%d,%d)" % (got["cx"], got["cy"]))
         else:
             _t.sleep(1.2)
     return casting_owner(serial)
 
 
 # ── 主流程 ─────────────────────────────────────────────────
+CAST_LOCK = "/tmp/_cast.lock"
+
+
 def run(serial=None, tries=3, log=print):
-    serial = serial or os.environ.get("PHONE_SERIAL", "892e20c9")
+    """完整投屏流程。
+
+    全程持有一把文件锁：Tasker 的 /cast 和 keepcast 守护可能同时触发，
+    两边都点屏幕会互相踩（一个在等授权、另一个已经开始点下一步）。
+    锁拿不到说明别人正在跑，直接返回，让对方干完。
+    """
+    import fcntl
+
+    with open(CAST_LOCK, "w") as _lf:
+        try:
+            fcntl.flock(_lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"ok": False, "why": "已有投屏流程在跑，本次让路",
+                    "steps": []}
+        return _run_locked(serial=serial, tries=tries, log=log)
+
+
+def _run_locked(serial=None, tries=3, log=print):
+    serial = serial or pick_serial()
     rec = {"ok": False, "why": "", "steps": []}
 
     def step(m):
         rec["steps"].append(m)
         log(m)
+
+    # ── 第一步：USB 用途 ──
+    # 插线后先放充电动画（约 15 秒），然后弹「USB 用于 / 仅限充电 / 传输文件」。
+    # 必须选「传输文件」，否则 USB 只供电不出数据，adb 直接看不到设备。
+    # 这一步失败不阻断：WiFi adb 可能还在，后面靠 pick_serial 会切过去。
+    try:
+        ur = do_step("usb", serial=serial, log=log)
+        step("USB：%s" % ur.get("why", ""))
+    except Exception as e:
+        step("USB 步骤出错（继续）：%s" % str(e)[:60])
 
     # 已经开着就不用再动（Tasker 可能重复触发）
     owner = casting_owner(serial)
@@ -374,8 +496,12 @@ def run(serial=None, tries=3, log=print):
     app = foreground(serial)
     if not app.startswith(APP):
         step("豆包不在前台（%s），先拉起" % (app or "未知"))
-        _adb(serial, "shell", "am force-stop " + APP)
-        time.sleep(1.2)
+        # 只有确认没在投屏才 force-stop。正在投屏时杀进程 = 掐断画面。
+        if not casting_owner(serial):
+            _adb(serial, "shell", "am force-stop " + APP)
+            time.sleep(1.2)
+        else:
+            step("检测到投屏开着，只用 am start 拉起，不杀进程")
         _adb(serial, "shell",
              "monkey -p %s -c android.intent.category.LAUNCHER 1" % APP)
         for _ in range(20):
@@ -428,18 +554,353 @@ def run(serial=None, tries=3, log=print):
         step("画面确认：%s（%s）" % ("通过" if rec["ok"] else "未通过",
                                     vr.get("reason", "")))
     except Exception as e:
-        rec["ok"] = True
-        rec["why"] = "画面确认跳过（%s），以系统状态为准" % str(e)[:60]
+        # 验证本身出错，不能当成"通过"。
+        # 以前这里写 ok=True，结果模型调用失败（返回非 JSON）时
+        # 流程报成功、屏幕却是黑的。现在退回到系统状态这一条硬证据。
+        owner2 = casting_owner(serial)
+        if owner2:
+            rec["ok"] = True
+            rec["why"] = ("画面确认跳过（%s），但系统仍报投屏 owner=%s"
+                          % (str(e)[:50], owner2))
+        else:
+            rec["ok"] = False
+            rec["why"] = ("画面确认出错（%s），且系统里查不到投屏会话"
+                          % str(e)[:50])
         step(rec["why"])
+
+    # ── 最后一步：成功就回桌面 ──
+    # 为什么要回：投屏共享的是"手机屏幕"，通话页上全是豆包的按钮和头像，
+    # 对方看到的就是这些。回 HOME 之后共享画面变成桌面，才是用户想要的。
+    #
+    # 注意：按 HOME 不会中断投屏（共享的是屏幕，不是某个应用），
+    # 但必须按完回头确认 owner 还在 —— 万一某版系统把它当"应用退到后台"
+    # 掐掉，得立刻知道，不能报成功。
+    if rec["ok"]:
+        _adb(serial, "shell", "input keyevent KEYCODE_HOME")
+        time.sleep(1.5)
+        left = casting_owner(serial)
+        cur = foreground(serial)
+        if left:
+            step("已按 HOME 回桌面（%s），投屏仍在" % (cur or "未知"))
+        else:
+            rec["ok"] = False
+            rec["why"] = "回桌面后投屏没了（按 HOME 把会话掐断了）"
+            step(rec["why"])
+
     return rec
 
 
 # ── 给 Tasker 用的 HTTP 接口 ───────────────────────────────
+STEPS = {
+    "usb":      "等插线弹窗，选「文件传输」",
+    "wake":     "唤醒屏幕并解锁",
+    "popup":    "关掉「USB 用于」弹窗",
+    "launch":   "启动豆包（不杀进程）",
+    "restart":  "杀干净再启动豆包，落到首页",
+    "home_ok":  "确认当前在豆包首页",
+    "tap_call": "点「打电话」，确认进了通话页",
+    "tap_cast": "点「开启投屏」并授权，确认系统有投屏会话",
+    "verify":   "确认画面真的在共享",
+    "desktop":  "回到桌面",
+    "status":   "只读：报告当前前台/投屏状态",
+}
+
+
+def do_step(name, serial=None, log=print, force=False):
+    """单个原子操作。每个都自己验证，返回 {ok, now, ...}。"""
+    serial = serial or pick_serial()
+    r = {"step": name, "ok": False, "why": ""}
+
+    def fg():
+        return foreground(serial)
+
+    # 设备真的在吗？不在就别假装成功。
+    def alive():
+        out = _adb(serial, "shell", "echo ok", timeout=8)
+        return "ok" in out
+
+    if name in ("usb", "wake", "popup", "launch", "restart", "home_ok",
+                "tap_call", "tap_cast", "verify", "desktop"):
+        if not alive():
+            r["why"] = "手机没连上 adb（adb devices 为空）"
+            log("[step:%s] FAIL  %s" % (name, r["why"]))
+            return r
+
+    if name == "usb":
+        # 插线后手机会先放 15 秒左右的充电动画，然后才弹「选择充电方式」，
+        # 里面是「仅限充电 / 传输文件 / 传输照片 …」。必须点「传输文件」，
+        # 否则 USB 只出电不出数据。
+        #
+        # 为什么不能像旧 popup 那样一看到 USB 就按 BACK：
+        #   这个选择框按 BACK 等于"什么都没选"，多半回落到仅充电，
+        #   后面整条链全废。必须点到「传输文件」。
+        import uitap
+
+        def picked():
+            """已经选过文件传输了吗？看系统属性，比看界面可靠。"""
+            st = _adb(serial, "shell", "getprop sys.usb.state").strip()
+            cfg = _adb(serial, "shell", "getprop sys.usb.config").strip()
+            return "mtp" in st or "mtp" in cfg
+
+        # 弹窗正开着就别短路——哪怕 usb.state 已经是 mtp（插拔中途、
+        # 或用户手点过又弹出来），留着这个框会挡住后面所有点击。
+        dlg_up = "UsbModeChooser" in fg() or "传输文件" in " ".join(
+            uitap.names(uitap.dump(serial), clickable_only=False))
+
+        if picked() and not dlg_up:
+            r["ok"] = True
+            r["why"] = "USB 已经是文件传输模式（%s）" % (
+                _adb(serial, "shell", "getprop sys.usb.state").strip() or "?")
+            r["focus"] = fg()
+            log("[step:usb] OK  %s" % r["why"])
+            return r
+
+        # 主动把选择框叫出来，不靠盲等。
+        #
+        # 为什么要这样：插线那一刻的弹窗只有一次机会，抓不到就没了。
+        # 而这个 Activity 可以直接 am start 出来（实测可行）：
+        #   com.android.settings/.connecteddevice.usb.UsbModeChooserActivity
+        # 叫出来之后点「传输文件」，等于替用户做了选择。
+        #
+        # 坑（实测踩了 150 秒）：三个选项的文字节点是 clickable=false，
+        # 真正接收点击的是外面那层容器。用默认 clickable_only=True 找
+        # 「传输文件」永远找不到，循环空转到超时。必须 clickable_only=False，
+        # 点文字中心坐标 —— 容器覆盖着它，照样生效。
+        #
+        # 另一个坑：文案是「传输文件」，不是「文件传输」。
+        TEXTS = ("传输文件", "文件传输")
+        got = None
+
+        def try_pick():
+            for t in TEXTS:
+                lb = " ".join(uitap.names(uitap.dump(serial),
+                                          clickable_only=False))
+                if t in lb:
+                    return uitap.click(serial, t, exact=True,
+                                       clickable_only=False, wait=1.8)
+            return None
+
+        # 1) 弹窗本来就开着（插线后最常见）——直接点
+        got = try_pick()
+
+        # 2) 没开就自己叫出来，再点
+        if not got:
+            _adb(serial, "shell",
+                 "am start -n com.android.settings/"
+                 ".connecteddevice.usb.UsbModeChooserActivity")
+            time.sleep(2.0)
+            got = try_pick()
+
+        if got:
+            time.sleep(1.5)
+            r["ok"] = picked()
+            r["why"] = ("已选「%s」，USB=%s" % (
+                (got["text"] or got["desc"])[:10],
+                _adb(serial, "shell", "getprop sys.usb.state").strip())
+                if r["ok"] else "点了「传输文件」但 USB 仍是 %s" % (
+                    _adb(serial, "shell", "getprop sys.usb.state").strip() or "空"))
+        else:
+            r["ok"] = picked()
+            st = _adb(serial, "shell", "getprop sys.usb.state").strip()
+            r["why"] = ("叫出了选择框也没点中「传输文件」，但 USB 已是 %s" % st
+                        if r["ok"] else
+                        "叫出选择框也没找到「传输文件」（界面：%s）"
+                        % " ".join(uitap.names(uitap.dump(serial),
+                                               clickable_only=False))[:60])
+        r["focus"] = fg()
+
+    elif name == "wake":
+        _adb(serial, "shell", "input keyevent KEYCODE_WAKEUP")
+        _adb(serial, "shell", "wm dismiss-keyguard")
+        time.sleep(1.2)
+        r["ok"] = True
+        r["why"] = "已唤醒"
+        r["focus"] = fg()
+
+    elif name == "popup":
+        # 两类弹窗会挡住后面所有点击：
+        #   1. MIUI 插线的「USB 用于」——按 BACK 关
+        #   2. 系统权限框（通知/麦克风/屏幕录制）——必须点允许，BACK 关不掉
+        # 实测踩过：重启豆包后弹「是否允许发送通知」，脚本不认它，
+        # 后面所有点击全落在权限框上，整轮报废。
+        import uitap
+        closed, allowed = 0, 0
+        for i in range(4):
+            ns = uitap.dump(serial)
+            labels = uitap.names(ns)
+            joined = " ".join(labels)
+
+            # 权限框：出现"允许"类按钮就直接点允许
+            if "允许" in joined or "Allow" in joined:
+                got = (uitap.click(serial, "始终允许", wait=1.2)
+                       or uitap.click(serial, "仅在使用中允许", wait=1.2)
+                       or uitap.click(serial, "允许", wait=1.2))
+                if got:
+                    allowed += 1
+                    log("[popup] 点「%s」授权 @(%d,%d)"
+                        % ((got["text"] or got["desc"])[:12], got["cx"], got["cy"]))
+                    continue
+
+            # USB 弹窗：含「用于」/「用途」的 USB 提示
+            if "USB" in joined and ("用于" in joined or "用途" in joined
+                                    or "连接" in joined):
+                _adb(serial, "shell", "input keyevent KEYCODE_BACK")
+                closed += 1
+                time.sleep(0.9)
+                continue
+
+            r["ok"] = True
+            if closed == 0 and allowed == 0:
+                r["why"] = "没有弹窗"
+            else:
+                r["why"] = "关掉 %d 个 USB 弹窗、批准 %d 个权限" % (closed, allowed)
+            break
+        else:
+            r["ok"] = False
+            r["why"] = "弹窗关不掉（%s）" % (" ".join(uitap.names(uitap.dump(serial)))[:60])
+        r["focus"] = fg()
+
+    elif name == "launch":
+        # 注意：不 force-stop！豆包没在前台时只做启动
+        if fg().startswith(APP):
+            r["ok"] = True
+            r["why"] = "豆包已在前台"
+        else:
+            _adb(serial, "shell",
+                 "monkey -p %s -c android.intent.category.LAUNCHER 1" % APP)
+            for _ in range(20):
+                time.sleep(1)
+                if fg().startswith(APP):
+                    break
+            r["ok"] = fg().startswith(APP)
+            r["why"] = "已启动" if r["ok"] else "启动失败（%s）" % (fg() or "未知")
+        r["focus"] = fg()
+
+    elif name == "restart":
+        # 重启会 force-stop，可能把正在工作的投屏杀掉，所以默认拒绝。
+        # 调用方确实要重启（比如页面卡在别处）才传 force=1。
+        if casting_owner(serial) and not force:
+            r["ok"] = False
+            r["why"] = ("正在投屏，拒绝重启豆包（会杀掉投屏）。"
+                        "确实要重启请加 ?force=1")
+            log("[step:restart] FAIL  %s" % r["why"])
+            return r
+        ok = False
+        for i in range(3):
+            ok = bool(_restart_home(serial))
+            if ok:
+                break
+            log("[restart] 第%d次没起来，重试" % (i + 1))
+            time.sleep(2)
+        r["ok"] = ok
+        r["why"] = "已重启到首页" if ok else "起不来（%s）" % (fg() or "未知")
+        r["focus"] = fg()
+
+    elif name == "home_ok":
+        # 按名字判断，不靠模板。模板换主题/字号就失效。
+        import uitap
+        hit = None
+        for i in range(4):
+            ns = uitap.dump(serial)
+            hit = uitap.find(ns, "打电话")
+            if hit:
+                break
+            time.sleep(1.2)
+        r["ok"] = bool(hit)
+        if hit:
+            n = hit[0]
+            r["why"] = ("首页，无障碍树找到「打电话」@(%d,%d) bounds=%s"
+                        % (n["cx"], n["cy"], n["bounds"]))
+        else:
+            r["why"] = "没找到「打电话」按钮（当前 %s）" % (fg() or "未知")
+        r["focus"] = fg()
+
+    elif name == "tap_call":
+        # 幂等：已经在通话页就立刻返回，绝不再重启豆包
+        # （Tasker 可能重复触发；重启会 force-stop，把正在工作的投屏杀掉）
+        if "RealtimeCall" in fg():
+            r["ok"] = True
+            r["why"] = "已经在通话页，没动"
+            r["focus"] = fg()
+            log("[step:tap_call] OK  %s" % r["why"])
+            return r
+        ok = False
+        for i in range(3):
+            ok = bool(_enter_call(serial, lambda m: log("[tap_call] " + m)))
+            if ok:
+                break
+            log("[tap_call] 第%d次没进通话页，再来一次" % (i + 1))
+            time.sleep(2)
+        r["ok"] = ok
+        r["why"] = "已进入通话页" if ok else "没进通话页（%s）" % (fg() or "未知")
+        r["focus"] = fg()
+
+    elif name == "tap_cast":
+        owner = casting_owner(serial)
+        if owner:
+            r["ok"] = True
+            r["why"] = "投屏本来就开着（owner %s）" % owner
+        else:
+            for i in range(3):
+                owner = _open_cast(serial, lambda m: log("[tap_cast] " + m))
+                if owner:
+                    break
+                log("[tap_cast] 第%d次没开成，重来" % (i + 1))
+                time.sleep(1.5)
+            r["ok"] = bool(owner)
+            r["why"] = "系统确认投屏" if r["ok"] else "点过但系统没会话"
+        r["owner"] = owner
+        r["focus"] = fg()
+
+    elif name == "verify":
+        try:
+            import aiverify
+            vr = aiverify.verify(serial)
+            r["ok"] = bool(vr["ok"])
+            r["why"] = vr.get("reason", "")
+        except Exception as e:
+            r["ok"] = False
+            r["why"] = "验证出错: %s" % str(e)[:80]
+        r["owner"] = casting_owner(serial)
+        r["focus"] = fg()
+
+    elif name == "desktop":
+        _adb(serial, "shell", "input keyevent KEYCODE_HOME")
+        time.sleep(1.5)
+        cur = fg()
+        r["ok"] = bool(cur) and not cur.startswith(APP)
+        r["why"] = "已回桌面（%s）" % cur if r["ok"] else "还停在 %s" % (cur or "未知")
+        r["focus"] = cur
+        r["owner"] = casting_owner(serial)
+
+    elif name == "status":
+        r["ok"] = True
+        r["why"] = "只读"
+        r["focus"] = fg()
+        r["owner"] = casting_owner(serial)
+        r["casting"] = bool(r["owner"])
+
+    else:
+        r["why"] = "未知步骤 %r，可用：%s" % (name, ",".join(STEPS))
+
+    log("[step:%s] %s  %s" % (name, "OK" if r["ok"] else "FAIL", r["why"]))
+    return r
+
+
 def serve(port=8130, log=None):
     """Tasker 只需要一个 HTTP Request：POST http://<板子IP>:8130/cast
 
     返回 JSON：{"ok":true,...} 就是投屏已确认开好。
     GET /health 用来探板子在不在。
+
+    单步接口（每一步自己验证，失败就是失败，不会假成功）：
+      POST /step/tap_call     点「打电话」并确认进了通话页
+      POST /step/tap_cast     点「开启投屏」并确认系统有会话
+      POST /step/verify       确认画面真在共享
+      POST /step/desktop      回桌面
+      GET  /step/status       只读状态
+      GET  /steps             列出所有可用步骤
+    通用形式：POST /do?step=tap_call  或 POST /step/tap_call?serial=xxx
     """
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import sys
@@ -460,26 +921,56 @@ def serve(port=8130, log=None):
             self.wfile.write(body)
 
         def do_GET(self):
-            if self.path.startswith("/health"):
+            p = self.path.split("?")[0].rstrip("/") or "/"
+            if p == "/health":
                 return self._send(200, {
                     "ok": True, "app": APP,
-                    "casting": casting_owner(
-                        os.environ.get("PHONE_SERIAL", "892e20c9"))})
-            self._send(404, {"ok": False, "why": "未知路径"})
+                    "casting": casting_owner(pick_serial())})
+            if p == "/steps":
+                return self._send(200, {"ok": True, "steps": STEPS})
+            if p == "/step/status":
+                return self._send(200, do_step("status", log=out))
+            self._send(404, {"ok": False, "why": "未知路径",
+                             "try": ["/health", "/steps", "/step/status"]})
 
         def do_POST(self):
-            if not self.path.startswith("/cast"):
-                return self._send(404, {"ok": False, "why": "未知路径"})
-            try:
-                r = run(log=out)
-            except Exception as e:
-                r = {"ok": False, "why": "执行出错: %s" % e, "steps": []}
-            self._send(200 if r.get("ok") else 500, r)
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(self.path)
+            p, q = u.path.rstrip("/"), parse_qs(u.query)
+            serial = (q.get("serial") or [None])[0]
+
+            # 单步
+            name = None
+            if p.startswith("/step/"):
+                name = p[len("/step/"):]
+            elif p == "/do":
+                name = (q.get("step") or [None])[0]
+            if name:
+                try:
+                    raw_force = (q.get("force") or ["0"])[0]
+                    r = do_step(name, serial=serial, log=out,
+                                force=str(raw_force).lower() in ("1", "true", "yes"))
+                except Exception as e:
+                    r = {"step": name, "ok": False,
+                         "why": "执行出错: %s" % e}
+                return self._send(200 if r.get("ok") else 500, r)
+
+            if p == "/cast":
+                try:
+                    r = run(serial=serial, log=out)
+                except Exception as e:
+                    r = {"ok": False, "why": "执行出错: %s" % e, "steps": []}
+                return self._send(200 if r.get("ok") else 500, r)
+
+            self._send(404, {"ok": False, "why": "未知路径",
+                             "try": ["/cast", "/steps", "/step/tap_call"]})
 
         def log_message(self, *a):
             pass
 
     out("等 Tasker 调用：POST http://0.0.0.0:%d/cast" % port)
+    out("单步接口已开：/step/{wake,popup,launch,restart,home_ok,"
+        "tap_call,tap_cast,verify,desktop,status}")
     HTTPServer(("0.0.0.0", port), H).serve_forever()
 
 

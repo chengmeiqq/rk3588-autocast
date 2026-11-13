@@ -1,0 +1,10 @@
+[Unit]
+Description=重启后自检（一次性）
+After=airtest-keepcast.service airtest-smartcast.service
+Wants=airtest-keepcast.service
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 45
+ExecStart=/root/.openclaw/workspace/Airtest/scripts/postboot_check.sh
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Airtest 豆包投屏守护（掉线自动重新拉起）
+After=network-online.target airtest-adbd.service
+Wants=airtest-adbd.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/Airtest
+Environment=ANDROID_HOME=/usr/lib/android-sdk
+Environment=PATH=/usr/lib/android-sdk/platform-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=KEEPCAST_INTERVAL=20
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/.openclaw/workspace/Airtest/.venv/bin/python ./keepcast.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

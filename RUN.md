@@ -1406,3 +1406,142 @@ HTTP：airweb / = 200；smartcast /health = {"ok": true, ...}
 
 **结论**：若断电重启常犯 `error -32`，需硬件侧方案（带独立开关的 USB HUB，
 开机脚本先断电再上电），纯软件无解。
+
+---
+
+## 2026-11-13 12:50~13:00 固化与全链路重启验证
+
+### 目标
+把「USB 用途框反复弹出」「Tasker 被 MIUI 杀掉」两个问题彻底关掉，
+并把所有服务固化到开机自启，用**真实重启板子**验证。
+
+### 已落地的改动
+
+| 文件 | 改动 |
+|---|---|
+| `keepcast.py` | 新增 `usb_dialog_watch()`、`tasker_watch()`、`ensure_usb_receiver_disabled()`、`check_receiver_after_boot()` |
+| `smartcast.py` | `usb` 步骤 + `_run_locked` 持锁包装 |
+| `deploy/airtest-keepcast.service` | 新增 |
+| `deploy/airtest-adbd.service` | 新增 |
+| `deploy/airtest-postboot-check.service` | 新增（oneshot 自检） |
+| `scripts/postboot_check.sh` | 新增 |
+
+### 板子重启验证（真实执行，非模拟）
+
+重启前必须先确认**网关能自己回来**，否则会彻底失联：
+
+```bash
+export XDG_RUNTIME_DIR=/run/user/0
+systemctl --user is-enabled openclaw-gateway.service   # 期望 enabled
+loginctl show-user root | grep Linger                  # 期望 Linger=yes
+ls /var/lib/systemd/linger/root                        # 必须存在
+```
+
+三项缺一不可 —— 这是**用户级**服务，没有 linger 时开机不会启动。
+
+重启命令（`nohup ... &` 不行，会被 exec 会话一起 kill，板子根本不重启）：
+
+```bash
+systemd-run --on-active=3 --unit=board-reboot-now systemctl reboot
+```
+
+重启后实测：
+
+```
+12:51:17  Tasker 已重新拉起（pid=9330）
+12:51:43  掉线（豆包进程没了、投屏没了）→ 重新拉起
+12:51:47  USB 已经是文件传输模式（mtp,adb）
+12:51:48  豆包不在前台，先拉起
+12:51:54  「打电话」@(395,2084)
+12:51:59  「共享屏幕」@(413,2117)
+12:52:02  点「立即开始」授权
+12:52:03  系统确认投屏会话：owner com.larus.nova
+12:52:06  画面确认：通过
+12:52:08  已按 HOME 回桌面，投屏仍在
+```
+
+**开机到投屏成功 25 秒，无人干预。**
+
+### 坑：/tmp 重启会被清空
+
+自检脚本最初放 `/tmp/postboot_check.sh`，重启后单元直接
+`status=203/EXEC`。已改到 `scripts/postboot_check.sh`。
+
+### USB 用途框：根因与两层处理
+
+根因是 `UsbModeChooserReceiver` 对五个广播都 `startActivity`：
+
+```
+UsbModeChooserReceiver: action = android.hardware.usb.action.USB_STATE
+UsbModeChooserReceiver: action = android.settings.action.MEDIA_MTP_TRANSFER_FAILED
+START u0 {cmp=com.android.settings/.Settings$UsbDetailsActivity}
+```
+
+处理：
+
+```bash
+# 只禁这一个组件，不动 com.android.settings 本体
+adb -s 892e20c9 shell 'su -c "pm disable --user 0 \
+  com.android.settings/.connecteddevice.usb.UsbModeChooserReceiver"'
+# → Component {...} new state: disabled
+```
+
+**恢复原行为**：
+
+```bash
+adb -s 892e20c9 shell 'su -c "pm enable --user 0 \
+  com.android.settings/.connecteddevice.usb.UsbModeChooserReceiver"'
+```
+
+注意：该系统**没有** `pm get-component-enabled-state`（`Unknown command`），
+无法查询状态；`pm disable` 是幂等的，所以守护每次启动无条件执行一次即可。
+
+### boot_id 自愈（手机重启后自动补禁）
+
+不做定时 `su` 复查（费电），改读 `/proc/sys/kernel/random/boot_id`（普通权限可读）：
+
+- 与 `state/phone_boot_id` 不一致 → 判定手机重启过 → 重新 disable 一次
+- 一致 → 什么都不做
+
+实测模拟：把记录改成 `00000000-dead-beef-dead-000000000000` 后，
+12:59:16 自动检测并重新 disable，记录恢复真实值。
+
+### Tasker 防杀：结论是「不刷模块」
+
+已查实并排除的手段：
+
+| 手段 | 现状 | 结果 |
+|---|---|---|
+| 电池优化白名单 | 已加入 | 仍被杀 |
+| powerkeeper `bgControl` | 已是 `noRestrict` | 仍被杀 |
+| `manual_list.white_list`（自启动白名单） | 整表为空 | 无内容可加 |
+| Magisk 防杀模块 | 无可信项目 | 不刷，风险大且升级易失效 |
+
+**采用板子侧看门狗**，不动手机系统。实测 `am force-stop` 后 **12 秒**复活。
+
+### 又一次真实自愈（非模拟）
+
+```
+12:59:20  Tasker 不在（被 MIUI 杀了），重新拉起
+12:59:28  Tasker 已重新拉起（pid=11616）        # 8 秒
+12:59:40  已拉起豆包
+12:59:43  「打电话」@(395,2084)
+12:59:48  「共享屏幕」@(413,2117)
+12:59:51  点「立即开始」授权 + 系统确认投屏会话
+12:59:55  画面确认：通过
+12:59:56  已按 HOME 回桌面，投屏仍在            # 共 18 秒
+```
+
+### 状态文件读取注意
+
+重拉成功后，`state/keepcast.json` 里的 `pid` 要**等下一轮主循环**才刷新
+（实测滞后约 20 秒，显示旧 pid 而实际已换新）。不是 bug。
+
+### 已验证 / 未验证
+
+- ✅ 板子重启后全链路自动恢复（真实重启）
+- ✅ 手机侧的 receiver 禁用挺过板子重启
+- ✅ 手机重启后自动补禁（boot_id 模拟验证）
+- ✅ 豆包被杀、Tasker 被杀均自愈
+- ⚠️ 手机**真的重启**后 `package-restrictions.xml` 是否被 MIUI 重置，
+  无真机依据 —— 但 boot_id 机制会在它插回来后第一轮自动补上
