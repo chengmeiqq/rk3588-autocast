@@ -13,7 +13,8 @@
   人不在旁边就发现不了，所以要有东西替我们盯着。
 
 守什么（判断依据，两把尺子都要动）：
-  - `casting_owner`：系统里还有没有 ScreenCapture 虚拟屏
+  - `casting_owner`：虚拟屏 + 采集服务前台双判据
+    （只看虚拟屏会被残留骗：进程在、屏残留、投屏已死，实测发生过）
   - `pidof com.larus.nova`：豆包进程还活着吗
   只有两个都成立才算健康。只看进程不行 —— 进程在、投屏被掐掉的情况
   真实发生过；只看投屏也不行 —— 会话对象残留时进程可能已经死了。
@@ -497,7 +498,11 @@ def main():
                            note="投屏中", fails=0, paused=False, plugged=True,
                            since=time.strftime("%H:%M:%S",
                                                time.localtime(started_at)),
-                           uptime=int(time.time() - started_at))
+                           uptime=int(time.time() - started_at),
+                           # why 必须显式清掉：save_state 是 dict.update 语义，
+                           # 不传就会把历史上那次失败的原因一直留着，
+                           # 状态看起来正常、why 却写着"投屏没了"，非常误导。
+                           why="")
                 fails = 0
                 time.sleep(CHECK_EVERY)
                 continue

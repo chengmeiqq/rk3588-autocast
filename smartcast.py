@@ -273,13 +273,70 @@ def tap_text(serial, want):
     return None
 
 
-def casting_owner(serial):
+def _vd_owner(serial):
+    """判据 A：DisplayManager 里的 ScreenCapture 虚拟屏 owner。
+
+    便宜（一条 adb，约 40ms），但**不可独信**：虚拟屏比投屏会话活得久，
+    会话被掐断后它可能残留几十秒到几分钟一直挂在列表里。
+    """
     out = _adb(serial, "shell", "dumpsys display | grep ScreenCapture")
     for line in out.splitlines():
         if "owner" in line:
             seg = line.split("owner", 1)[1].split()
             return seg[0] if seg else ""
     return ""
+
+
+def _sc_service_foreground(serial, app=None):
+    """判据 B：投屏采集服务是否真的在前台。
+
+    返回 True / False / None：
+      True  —— 找到 ScreenCaptureService 且 isForeground=true（确实在采集）
+      False —— 找到该服务但不在前台（残留的死服务）
+      None  —— 没找到，或输出读不到（判不了，交给调用方决定）
+
+    为什么要这条：实测 13:09:48~13:10:31，虚拟屏还在、豆包进程也在，
+    但投屏早就没了（dumpsys media_projection 为 null，屏幕上停在桌面），
+    守护和 /cast 都被骗成"健康"，导致该救的时候不救。
+    """
+    app = app or APP
+    out = _adb(serial, "shell", "dumpsys activity services " + app)
+    if not out.strip():
+        return None
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        # 只认 ServiceRecord 那一行；intent= 里也有同名类，不能算
+        if line.lstrip().startswith("* ServiceRecord") and \
+                "ScreenCaptureService}" in line:
+            # isForeground 在该段较靠后（实测第 8 行），扫到下一个 ServiceRecord
+            for nxt in lines[i + 1:i + 40]:
+                if nxt.lstrip().startswith("* ServiceRecord"):
+                    break
+                if "isForeground=" in nxt:
+                    return "isForeground=true" in nxt
+            return False
+    return False
+
+
+def casting_owner(serial):
+    """当前有效的投屏 owner；没有在投屏就返回 ""。
+
+    两段判据，缺一不可先看 A 再看 B：
+      A. 有没有 ScreenCapture 虚拟屏（便宜，先筛）
+      B. 采集服务是否在前台（贵一条 adb，但能识破残留虚拟屏）
+
+    A 为空 → 直接判"没在投屏"，只花一条命令。
+    A 有、B 明确为假 → 判定为残留，返回 ""，让上层去重建。
+    B 读不到（adb 抖动/系统版本差异）→ 退回信任 A，宁可放过也不误杀，
+      否则一次 adb 抖动就会把正常投屏判死、触发一整轮重建。
+    """
+    owner = _vd_owner(serial)
+    if not owner:
+        return ""
+    alive = _sc_service_foreground(serial)
+    if alive is False:
+        return ""
+    return owner
 
 
 def _enter_call(serial, step):
