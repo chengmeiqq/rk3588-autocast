@@ -1,0 +1,21 @@
+[Unit]
+Description=Airtest smartcast（Tasker 调用的窄接口 HTTP 8130）
+After=network-online.target airtest-timesync.service airtest-airweb.service
+Wants=network-online.target airtest-timesync.service
+Requires=airtest-airweb.service
+
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/Airtest
+ExecStart=/root/.openclaw/workspace/Airtest/.venv/bin/python ./smartcast.py --serve 8130
+Restart=always
+RestartSec=5
+Environment=ANDROID_HOME=/usr/lib/android-sdk
+Environment=PATH=/usr/lib/android-sdk/platform-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardOutput=append:/root/.openclaw/workspace/Airtest/logs/smartcast.log
+StandardError=append:/root/.openclaw/workspace/Airtest/logs/smartcast.log
+
+[Install]
+WantedBy=multi-user.target

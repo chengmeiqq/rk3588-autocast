@@ -154,8 +154,44 @@ def wait_system_ready_here(max_wait=180, settle=15):
         return False, "等系统就绪失败（%s），跳过" % e
 
 
+def _run_once(url, steps, tag=""):
+    """调一次 /flow/run，返回 (全通过?, 结果dict)。"""
+    try:
+        out = subprocess.run(
+            ["curl", "-s", "-m", "600", "-X", "POST", url + "/flow/run",
+             "-H", "Content-Type: application/json",
+             "-d", __import__("json").dumps(
+                 {"steps": steps, "tries": 8, "interval": 0.8,
+                  "retry": 3, "resume_rounds": 3}, ensure_ascii=False)],
+            capture_output=True, text=True, timeout=620).stdout
+        r = __import__("json").loads(out)
+    except Exception as e:
+        log("调用流程接口失败: %s" % e)
+        return False, {}
+
+    acc = 0
+    for rec in r.get("results", []):
+        ok = rec.get("action_ok") and rec.get("verify_ok") is not False
+        acc += int(rec.get("ms") or 0)
+        # 这些行是流程跑完后一次性补打的，时间戳都一样。额外标出"到这一步
+        # 累计用了多少秒"，才能看出时间花在哪、哪一步变慢了。
+        log("  %s %s. %s (%sms, 累计%.1fs)" % (
+            "OK " if ok else "FAIL", rec.get("i"), rec.get("desc"),
+            rec.get("ms"), acc / 1000.0))
+    for x in r.get("resume_log", []):
+        log("  [恢复] 第%d步失败 → %s" % (x.get("failed_at"), x.get("did")))
+    log("流程结束：%s  用时 %sms  %s/%s 步通过（轮次 %s）" % (
+        "全部通过" if r.get("all_pass") else "有失败",
+        r.get("ms"), r.get("done"), r.get("total"), r.get("rounds")))
+    return bool(r.get("all_pass")), r
+
+
 def run_flow():
-    """调 airweb 跑流程。"""
+    """调 airweb 跑流程，最后用视觉模型确认屏幕真的在共享。
+
+    只信模板匹配不够：实测出现过 7/7 全过但 dumpsys 里没有投屏会话，
+    孩子那边是黑的。所以跑完必须过 AI 验证；不过就重跑。
+    """
     url = os.environ.get("AIRWEB", "http://127.0.0.1:8123")
     flow = os.environ.get("FLOW", os.path.join(HERE, "flows", "通话投屏.json"))
     try:
@@ -180,35 +216,84 @@ def run_flow():
         log(why)
         if not ok:
             log("系统没就绪，仍然试着跑（比直接放弃强）")
-    log(">>> 开始执行流程（%d 步）" % len(steps))
+    # 跑 + AI 验证 + 不过则重跑。
+    # 为什么要重跑：实测第 4 步（点 打电话）会偶发失败，手动点同位置立刻成功，
+    # 说明不是坐标问题而是手机当下的状态问题，重跑一次基本就好了。
+    MAX_ATTEMPTS = int(os.environ.get("FLOW_ATTEMPTS", "3"))
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            log(">>> 第 %d 次尝试" % attempt)
+            # 上一轮可能停在任意界面，退回桌面再来
+            try:
+                subprocess.run(["adb", "-s", SERIAL, "shell", "input", "keyevent",
+                                "KEYCODE_HOME"], capture_output=True, timeout=15)
+                time.sleep(2)
+            except Exception:
+                pass
+
+        log(">>> 开始执行流程（%d 步）" % len(steps))
+        flow_ok, r = _run_once(url, steps)
+        log(">>> 模板流程%s" % ("通过" if flow_ok else "有失败"))
+
+        if not flow_ok:
+            # 模板流程失败时交给 smartcast：它同样用模板找按钮，但会叠加
+            # 大模型判断页面、坐标核对、以及「点错了就拉回首页重来」。
+            # 实测模板流程卡在会话详情页时（底部没有打电话），融合路径
+            # 能自己回首页并点对，所以这是有意义的第二道路径。
+            log(">>> 模板流程没成，切 AI 融合路径")
+            try:
+                import smartcast
+                sr = smartcast.run(SERIAL, log=lambda m: log("    [cast] " + m))
+                log(">>> AI 融合路径：%s（%s）" % ("成功" if sr["ok"] else "失败",
+                                              sr.get("why", "")))
+                flow_ok = flow_ok or bool(sr["ok"])
+            except Exception as e:
+                log(">>> AI 融合路径出错: %s" % str(e)[:120])
+
+        # 模板匹配说通过不算数，要看屏幕真的在共享。
+        try:
+            import aiverify
+            vr = aiverify.verify(SERIAL)
+            log(">>> AI 验证：%s（%s）" % ("通过" if vr["ok"] else "未通过",
+                                          vr.get("reason", "")))
+            if vr.get("llm_evidence"):
+                log("    模型看到：%s" % vr["llm_evidence"])
+        except Exception as e:
+            log("AI 验证出错（%s），按流程结果判定" % e)
+            vr = {"ok": flow_ok}
+
+        if flow_ok and vr.get("ok"):
+            log(">>> 执行成功（第 %d 次尝试，已确认屏幕正在共享）" % attempt)
+            return True
+
+        if attempt < MAX_ATTEMPTS:
+            log(">>> 没成，%.0fs 后再来一次" % 8)
+            time.sleep(8)
+
+    log(">>> 执行失败：试了 %d 次都没能确认投屏" % MAX_ATTEMPTS)
+    return False
+
+
+def cast_owner_now():
+    """快速看现在有没有在共享屏幕，返回 owner 包名或空串。
+
+    不用截图也不用问模型，只查一次 dumpsys，几百毫秒。守护循环要每
+    20 秒查一次，不能每次都截图+叫模型（那会烧钱也会拖慢）。
+    """
+    dev = any_device()
+    if not dev:
+        return ""
     try:
         out = subprocess.run(
-            ["curl", "-s", "-m", "600", "-X", "POST", url + "/flow/run",
-             "-H", "Content-Type: application/json",
-             "-d", __import__("json").dumps(
-                 {"steps": steps, "tries": 8, "interval": 0.8,
-                  "retry": 3, "resume_rounds": 3}, ensure_ascii=False)],
-            capture_output=True, text=True, timeout=620).stdout
-        r = __import__("json").loads(out)
-    except Exception as e:
-        log("调用流程接口失败: %s" % e)
-        return False
-    acc = 0
-    for rec in r.get("results", []):
-        ok = rec.get("action_ok") and rec.get("verify_ok") is not False
-        acc += int(rec.get("ms") or 0)
-        # 这些行是流程跑完后一次性补打的，时间戳都一样。额外标出"到这一步
-        # 累计用了多少秒"，才能看出时间花在哪、哪一步变慢了。
-        log("  %s %s. %s (%sms, 累计%.1fs)" % (
-            "OK " if ok else "FAIL", rec.get("i"), rec.get("desc"),
-            rec.get("ms"), acc / 1000.0))
-    for x in r.get("resume_log", []):
-        log("  [恢复] 第%d步失败 → %s" % (x.get("failed_at"), x.get("did")))
-    log("流程结束：%s  用时 %sms  %s/%s 步通过（轮次 %s）" % (
-        "全部通过" if r.get("all_pass") else "有失败",
-        r.get("ms"), r.get("done"), r.get("total"), r.get("rounds")))
-    log(">>> 执行成功" if r.get("all_pass") else ">>> 执行失败")
-    return bool(r.get("all_pass"))
+            ["adb", "-s", dev, "shell", "dumpsys display | grep ScreenCapture"],
+            capture_output=True, text=True, timeout=20).stdout or ""
+    except Exception:
+        return ""
+    for line in out.splitlines():
+        if "owner" in line:
+            seg = line.split("owner", 1)[1].split()
+            return seg[0] if seg else ""
+    return ""
 
 
 def main():
@@ -219,31 +304,63 @@ def main():
     log("盯 USB 口：vendor=%s serial=%s（防抖 %.1fs）" % (VENDOR, SERIAL, DEBOUNCE))
     log("等 airweb 就绪…")
     url = os.environ.get("AIRWEB", "http://127.0.0.1:8123")
-    for _ in range(120):
+    # 探测用 "/"（永远 200），不能用 "/power"。
+    # 实测踩过：/power 内部要 connect_device，手机不在 USB 上时抛
+    # DeviceConnectionError → 500。板子刚通电那一刻手机往往还没枚举完，
+    # 于是这里判"airweb 没起来"，usbwatch 直接退出——而它正是要在
+    # 手机插上时干活的那个进程，退出了就再也不会有任何反应。
+    # 更不能"等不到就退出"：systemd 那边是 oneshot+RemainAfterExit，
+    # 进程死了不会有人重启它。所以这里无限等下去。
+    waited = 0
+    while True:
         rc = subprocess.run(["curl", "-s", "-m", "2", "-o", "/dev/null", "-w",
-                             "%{http_code}", url + "/power"],
+                             "%{http_code}", url + "/"],
                             capture_output=True, text=True).stdout.strip()
         if rc == "200":
             break
+        if waited and waited % 60 == 0:
+            log("还在等 airweb（已等 %ds）" % waited)
+        waited += 1
         time.sleep(1)
-    else:
-        log("airweb 一直没起来，先退出")
-        return 1
     log("airweb 就绪")
 
     present = find_phone() is not None
     log("当前状态：%s" % ("已插着" if present else "没插"))
     last_run = 0.0
 
+    # 投屏守护。
+    #
+    # 实测（logcat 两轮，精确到秒）：
+    #   11-13 06:50:04 建立 → 06:55:04 销毁 = 5分00秒
+    #   11-13 15:58:22 建立 → 16:03:22 销毁 = 5分00秒
+    # 豆包的通话到 5 分钟就自己结束（audio xlog 里 communication_time:306
+    # 出现 3 次），投屏跟着被停。所以"跑成功一次"不等于"孩子一直能看到"：
+    # 必须盯着 owner，没了就重新拉起。
+    CAST_WATCH = os.environ.get("CAST_WATCH", "1") == "1"
+    CAST_CHECK_EVERY = float(os.environ.get("CAST_CHECK_EVERY", "20"))
+    cast_up = False            # 我们认为现在应该在投屏吗
+    next_cast_check = 0.0
+
+    def rearm(reason):
+        """跑一轮流程，并把 cast_up 更新成真实状态。"""
+        nonlocal last_run, cast_up, next_cast_check
+        log(">>> %s" % reason)
+        last_run = time.time()
+        try:
+            ok = run_flow()
+        except Exception as e:
+            log("跑流程出错: %s" % e)
+            ok = False
+        cast_up = bool(cast_owner_now())
+        next_cast_check = time.time() + CAST_CHECK_EVERY
+        if ok and not cast_up:
+            log("流程说成功但 owner 已经没了（可能刚好卡在 5 分钟边界），下一轮再拉")
+        return ok
+
     # 板子开机时手机通常已经插着（用户给板子通电、手机靠 USB 自动开机）。
     # 这种情况下永远等不到"拔→插"的跳变，所以启动时插着就先跑一次。
     if present:
-        log("启动时已插着，先跑一次")
-        last_run = time.time()
-        try:
-            run_flow()
-        except Exception as e:
-            log("跑流程出错: %s" % e)
+        rearm("启动时已插着，先跑一次")
 
     while True:
         now = find_phone() is not None
@@ -258,13 +375,27 @@ def main():
                     if time.time() - last_run < COOLDOWN:
                         log("还在冷却期（%.0fs），跳过" % COOLDOWN)
                     else:
-                        last_run = time.time()
-                        try:
-                            run_flow()
-                        except Exception as e:
-                            log("跑流程出错: %s" % e)
+                        rearm("新插入，开始跑")
                 else:
                     log("已拔掉 USB")
+                    cast_up = False
+
+        # 投屏守护：每 CAST_CHECK_EVERY 秒查一次 owner。
+        # 只在手机插着、且我们以为应该在投屏时才查——手机不在时查也没用。
+        if CAST_WATCH and present and time.time() >= next_cast_check:
+            next_cast_check = time.time() + CAST_CHECK_EVERY
+            owner = cast_owner_now()
+            if owner:
+                if not cast_up:
+                    log("投屏在线（owner %s）" % owner)
+                cast_up = True
+            elif cast_up:
+                # 刚才是好的，现在没了 —— 豆包 5 分钟限制到点。
+                log("投屏不在了（owner 空），豆包限量到点，重新拉起")
+                cast_up = False
+                time.sleep(2)
+                rearm("掉线重拉")
+
         time.sleep(0.25)
 
 

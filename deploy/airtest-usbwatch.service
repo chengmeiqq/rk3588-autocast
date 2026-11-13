@@ -1,0 +1,23 @@
+[Unit]
+Description=Airtest USB 守护（手机插上/开机就自动跑投屏流程，崩了自动重启）
+After=network-online.target airtest-timesync.service
+Wants=network-online.target airtest-timesync.service
+# 这条是关键：它是常驻的触发者，死了必须有人拉起来。
+# 之前用 oneshot+RemainAfterExit 跑，进程一旦退出 systemd 不管，
+# 结果板子早上通电后它自己退了，插上手机也毫无反应。
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/Airtest
+ExecStart=/root/.openclaw/workspace/Airtest/.venv/bin/python ./usbwatch.py
+Restart=always
+RestartSec=5
+# 崩溃重启不能无限轰炸：5 秒退一次也算正常节奏，给足余量
+Environment=ANDROID_HOME=/usr/lib/android-sdk
+Environment=PATH=/usr/lib/android-sdk/platform-tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CAST_WATCH=1
+StandardOutput=append:/root/.openclaw/workspace/Airtest/logs/usbwatch.log
+StandardError=append:/root/.openclaw/workspace/Airtest/logs/usbwatch.log
+
+[Install]
+WantedBy=multi-user.target

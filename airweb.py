@@ -27,7 +27,7 @@ os.environ["PATH"] = "/usr/lib/android-sdk/platform-tools:" + os.environ.get("PA
 
 from flask import Flask, request, jsonify, send_file, Response
 
-from airlib import phone as make_phone
+from airlib import phone as make_phone, DEFAULT_SERIAL
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 TPL_DIR = os.path.join(ROOT, "templates")
@@ -495,6 +495,27 @@ def _one_step(p, step):
             time.sleep(0.6)
         return False, "屏幕上找不到文字「%s」（看到：%s）" % (
             want, "/".join(last_seen[:8]) or "空"), {}
+    if kind == "ensure_template":
+        # 豆包冷启动后有时会直接恢复到上次的"会话详情页"，底部没有
+        # 「打电话」。这时模板搜索会失败（或误匹配到别处的图标），
+        # 后面的验证必然全灭。实测：按一次 BACK 就回首页了。
+        # 所以这里先确认目标在不在，不在就按 BACK 直到出现或次数用完。
+        name = os.path.basename(step["name"])
+        path = os.path.join(TPL_DIR, name)
+        if not os.path.exists(path):
+            return False, "模板不存在：%s" % name, {"fatal": True}
+        th = float(step.get("threshold", 0.75))
+        backs = int(step.get("backs", 3))
+        for i in range(backs + 1):
+            pt = p.find(path, threshold=th, timeout=0)
+            if pt:
+                return True, ("已在目标页面（第%d次检查找到 %s）"
+                              % (i + 1, name)), {"backs": i}
+            if i < backs:
+                p.key("BACK")
+                time.sleep(float(step.get("back_wait", 1.5)))
+        return False, "按了 %d 次 BACK 仍没找到 %s" % (backs, name), {}
+
     if kind == "wake":
         # 插 USB 时手机多半是息屏的。不先唤醒，后面所有验证都会因为
         # mCurrentFocus=null 而超时。
@@ -534,6 +555,20 @@ def _one_step(p, step):
     if kind == "sleep":
         time.sleep(float(step.get("seconds", 1)))
         return True, "等 %ss" % step.get("seconds", 1), {}
+    if kind == "ai_cast":
+        # 让视觉大模型看图确认"此刻屏幕是否正在被共享"。
+        # 必须放在回桌面之前：MediaProjection 共享的是整屏，回到桌面后
+        # 屏幕上没有任何"正在共享屏幕"提示，模型只能看到桌面图标，会
+        # 误判成"没在共享"——实测踩过，8/8 全过却被判失败然后白重跑两次。
+        try:
+            import aiverify
+            vr = aiverify.verify(getattr(p, "serial", None) or DEFAULT_SERIAL)
+        except Exception as e:
+            return False, "AI 验证出错：%s" % str(e)[:100], {"fatal": False}
+        ev = vr.get("llm_evidence") or vr.get("reason") or ""
+        if vr.get("ok"):
+            return True, "AI 确认正在投屏（%s）" % ev[:60], {"ai_cast": True}
+        return False, "AI 看不出在投屏（%s）" % ev[:60], {"ai_cast": False}
     return False, "看不懂的动作：%r" % kind, {"fatal": True}
 
 

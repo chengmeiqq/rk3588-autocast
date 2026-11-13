@@ -1,17 +1,6 @@
-# 虚拟环境
 .venv/
-venv/
-
-# 运行时产物
 logs/
 __pycache__/
-*.py[cod]
-*.egg-info/
-
-# 备份与本地
+*.pyc
 *.bak
-.env
-.shots/
-shots/
-realtest.air/
-macros/demo-home.png
+/tmp/

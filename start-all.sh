@@ -26,10 +26,15 @@ fi
 # 3) airweb 是流程执行器，必须先在
 ./start-web.sh "${PORT:-8123}" >> logs/service.log 2>&1
 
-# 4) usbwatch 是触发器：启动时若已插着会自动跑一次
-./start-usbwatch.sh >> logs/service.log 2>&1
+# 4) usbwatch 现在是独立的 systemd 服务（airtest-usbwatch.service）。
+#    为什么移出来：它是常驻触发器，必须 Restart=always；而本服务是
+#    oneshot+RemainAfterExit，进程死了 systemd 不会管。实测就撞过：
+#    它自己退出后，插上手机毫无反应。所以别再在这里启动它。
 
-# 5) 音量键触发（可选，失败不影响主流程）
+# 5) smartcast：给 Tasker 调的窄接口（点打电话/点投屏/确认）
+./start-smartcast.sh "${CAST_PORT:-8130}" >> logs/service.log 2>&1
+
+# 6) 音量键触发（可选，失败不影响主流程）
 if [ -x ./start-keytrigger.sh ]; then
   ./start-keytrigger.sh >> logs/service.log 2>&1
 fi

@@ -1,0 +1,42 @@
+================ 板子运行状态 ================
+时间   : 2026-11-13 08:40:39 UTC
+主机   : rockchip  aarch64  kernel 5.10.66
+运行   : up 5 min  load average: 2.72, 2.17, 1.06
+开机于 : 2026-11-13 08:34:53
+
+---- 服务 ----
+  airtest-airweb       active   enabled  restarts=0
+  airtest-smartcast    active   enabled  restarts=0
+  airtest-usbwatch     active   enabled  restarts=0
+  airtest-timesync     active   enabled  restarts=0
+
+---- 进程 ----
+   1888       05:37 69960 /root/.openclaw/workspace/Airtest/.venv/bin/python ./airweb.py 8123
+   1889       05:37 16040 /root/.openclaw/workspace/Airtest/.venv/bin/python ./smartcast.py --serve 8130
+   1892       05:37 10308 /root/.openclaw/workspace/Airtest/.venv/bin/python ./usbwatch.py
+   6505       00:01   524 /bin/sh -c export PATH="${OPENCLAW_PREPEND_PATH}${PATH:+:$PATH}"; unset OPENCLAW_PREPEND_PATH; cd /root/.openclaw/workspace/Airtest echo "=== 今天状态报告存档" date '+%F %H:%M:%S' > /tmp/_stamp # 生成一份当前状态快照，随仓库一起发布 bash /tmp/status_report.sh > docs-status-2026-11-13.txt 2>/dev/null wc -l docs-status-2026-11-13.txt echo "=== 需要新增/?新的文件清单" for f in usbwatch.py smartcast.py aiverify.py airweb.py airlib.py RUN.md start-all.sh flows/通话投屏.json templates/视频通话.png docs-status-2026-11-13.txt start-smartcast.sh start-usbwatch.sh; do   [ -f "$f" ] && printf "  %-32s %s B\n" "$f" "$(stat -c%s "$f")" done
+
+---- 端口 ----
+LISTEN 0 0 0.0.0.0:8123 0.0.0.0:* users:(("python",pid=1888,fd=3)) 
+LISTEN 0 0 0.0.0.0:8130 0.0.0.0:* users:(("python",pid=1889,fd=3)) 
+
+---- HTTP ----
+  airweb  http://192.168.1.83:8123/  -> 200
+  smartcast /health -> {"ok": true, "app": "com.larus.nova", "casting": ""}
+
+---- 手机 ----
+  adb devices: 0 台
+    
+  USB 节点: （无，手机未枚举）
+  投屏 owner: （无 / 手机不可达）
+
+---- usbwatch 最近 8 行 ----
+  2026-11-13 08:32:24 >>> 模板流程通过
+  2026-11-13 08:32:45 >>> AI 验证：通过（模型与系统一致：正在投屏（放大状态栏看到 左侧出现红色带向上箭头的胶囊图标））
+  2026-11-13 08:32:45     模型看到：状态栏无共享或投屏提示 / 放大复查：左侧出现红色带向上箭头的胶囊图标
+  2026-11-13 08:32:45 >>> 执行成功（第 1 次尝试，已确认屏幕正在共享）
+  2026-11-13 08:35:03 盯 USB 口：vendor=18d1 serial=892e20c9（防抖 2.5s）
+  2026-11-13 08:35:03 等 airweb 就绪…
+  2026-11-13 08:35:04 airweb 就绪
+  2026-11-13 08:35:04 当前状态：没插
+==============================================

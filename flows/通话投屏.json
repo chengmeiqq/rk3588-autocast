@@ -21,6 +21,14 @@
       "expect_app": "com.larus.nova"
     },
     {
+      "do": "ensure_template",
+      "name": "打电话.png",
+      "threshold": 0.6,
+      "backs": 3,
+      "back_wait": 1.5,
+      "wait": 0.5
+    },
+    {
       "do": "tap_template",
       "name": "打电话.png",
       "threshold": 0.6,
@@ -42,6 +50,10 @@
       "find_timeout": 10,
       "expect_not_text": "立即开始",
       "expect_text": "正在共享屏幕"
+    },
+    {
+      "do": "ai_cast",
+      "wait": 0.5
     },
     {
       "do": "home",

@@ -8,6 +8,19 @@ RK3588 板子 + Android 手机：**通电即自动投屏**，无需人工干预�
 用 [Airtest](https://github.com/AirtestProject/Airtest) 做图像识别点击，
 Flask 提供 web 控制面板，systemd 负责开机自启。
 
+## 架构（2026-11-13）
+
+三个独立 systemd 服务，全部 `Restart=always`，崩了自动拉起：
+
+| 服务 | 端口 | 作用 |
+|---|---|---|
+| `airtest-airweb` | 8123 | 流程执行器，按步执行点击/截图/校验 |
+| `airtest-smartcast` | 8130 | Tasker 可调的窄接口：`POST /cast` |
+| `airtest-usbwatch` | — | 盯 USB 口，手机插上就开跑；兼投屏看门狗 |
+
+单元文件在 `deploy/`。`airtest-usbwatch` 每 20 秒查一次投屏 owner，
+一旦发现投屏消失就自动重跑整轮（豆包通话会被系统清理或挂断，断了必须能自愈）。
+
 ## 为什么需要这个
 
 本项目的难点不在"点按钮"，而在**无人值守**：

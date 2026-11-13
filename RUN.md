@@ -901,12 +901,6 @@ https://github.com/chengmeiqq/rk3588-autocast
 
 ## 14:22 那次失败的真实原因（2026-11-12 排查）
 
-> **注意：本节关于"供电不足导致关机"的结论后续被实测推翻。**
-> `Max charging current: 500000` 是上限协商值，不代表实际净电流；
-> 实测连着 USB 时电量持续上涨。真正的死因是 MIUI 的
-> `SwipeUpClean` / `OptimizationClean` 清理进程。
-> 请以下面「后续复核」一节为准。
-
 现象：只打开了豆包，第 4 步「打电话」没做，日志报 3 次
 `BrokenPipeError: [Errno 32] Broken pipe`，3/7 步通过后退出。
 
@@ -1194,3 +1188,221 @@ MemAvailable:    7055264 kB   (约 7GB 可用)
 
 **结论：手机在被人工操作时，投屏必掉。** 自动化适合无人值守场景
 （手机放着、没人碰），不适合边用边跑。
+
+---
+
+## 大模型 AI 与模板融合（2026-11-12 晚）
+
+### 为什么要融合，而不是纯 AI
+
+纯大模型做点击实测不可靠，两个硬数据：
+
+- **坐标会飘。** 同一张图问「打电话」在哪，裸图答 `(365,868)`，
+  真值 `bounds=[364,2067][481,2103]` 中心 `(422,2085)`，差 1200 多像素。
+  那次点下去竟然是成功的，纯属侥幸。
+- **认不出图标。** 通话页底部那颗「开启投屏」（方框带向上箭头），
+  模型三次都答"没有投屏图标"，甚至说成"上传已禁用"。
+
+给图片叠加 100px 坐标网格（红竖线标 x、绿横线标 y，线上写真实像素）后，
+同一个问题答 `(370,2100)`，落在按钮 bounds 内——**能用了**。
+
+但模板匹配的精度本来就是 0 误差（`打电话.png` 0.999、`开启投屏.png` 0.998），
+所以分工是：
+
+| 事情 | 谁干 | 为什么 |
+|---|---|---|
+| 找按钮坐标 | 模板优先，模板找不到才问模型 | 模板误差 0；模型要网格才准 |
+| 核对模型给的坐标 | 模板 | 偏差超 130px 就认为点错，不点 |
+| 判断当前是什么页面 | 模型 | 「首页 / 会话详情页 / 通话页」只有它看得懂 |
+| 点错之后怎么救 | 模型 + 重启豆包 | 实测按 BACK 会退到桌面，越走越远 |
+| 确认真的开好了 | `dumpsys` + 模型看图 | 两边都说在共享才算赢 |
+
+### 踩过的坑（都是实测）
+
+1. **AI 验证放在「回桌面」之后 → 误判**
+   流程 8/8 全过、投屏真的开着，但最后一步回桌面后，「正在共享屏幕」
+   横幅消失了，只剩状态栏一个几像素的小图标，模型答"没看到"，
+   于是一次成功的投屏被判失败、白重跑两轮（每轮 35 秒）。
+   **修法**：给 `airweb` 加 `ai_cast` 动作，插在「回桌面」之前（流程变 9 步）。
+   桌面上的复查再加一层"放大状态栏 3 倍"兜底。
+
+2. **重复点「开启投屏」会把投屏关掉**
+   点完图标后权限框有时要几秒才弹，旧代码 2.5 秒没等到就再点一次，
+   但那个位置此刻已经变成「停止投屏」了。三次重复点击的结果是
+   "点完了但系统里没有投屏会话"。
+   **修法**：点过图标就绝不再点，只轮询等结果（最多 16 秒）；
+   要重试就整轮推倒——重启豆包，界面干净再来。
+   改完单轮耗时从 40–138 秒降到 16–22 秒。
+
+3. **冷启动会停在侧栏抽屉，按 BACK 直接退到桌面**
+   `monkey` 拉起豆包有时停在左侧抽屉，按一次 BACK 不是回首页而是回桌面，
+   下一轮模型看到桌面又想点图标，越走越远。
+   **修法**：`_restart_home()`——`am force-stop` 后 `am start -n
+   com.larus.nova/com.larus.home.impl.alias.AliasActivity1`，比 monkey 稳。
+
+### 测试结果
+
+```
+smartcast 单独连跑 5 次：      5/5 通过，每轮 16–22 秒
+完整链路连跑 5 次：            5/5 通过，全部第 1 次尝试即成功
+                              （模板流程 37.6 秒 + AI 确认 4 秒）
+```
+
+### Tasker 怎么用
+
+板子上 `smartcast.py` 常驻在 `8130`，Tasker 只需要一个 **HTTP Request**：
+
+```
+POST http://192.168.1.83:8130/cast
+```
+
+返回 `{"ok": true, ...}` 即投屏已确认开好。探活用 `GET /health`。
+
+Tasker 负责前置（唤醒、开豆包、关 USB 弹窗），`smartcast` 只做
+「点打电话 → 点开启投屏 → 确认投屏」三件事——但即使 Tasker 前置没做好，
+它也会自己拉起豆包兜底。
+
+### 双保险
+
+`usbwatch.run_flow()` 里，模板流程失败时会自动切到 `smartcast`：
+
+```
+>>> 模板流程没成，切 AI 融合路径
+    [cast] 模板没命中，重启豆包回首页
+    [cast] 第2轮：模板命中「打电话」@(395,2075) 分数 0.999
+```
+
+实测有一轮模板流程只过 5/9（点「打电话」后没进通话页），
+融合路径接住并最终开出投屏。
+
+---
+
+## 2026-11-13 重构：从「一次 oneshot」改为「三个常驻服务 + 投屏看门狗」
+
+### 为什么改
+
+11-13 早上板子通电后完全没有反应。查日志发现两件事：
+
+**1. `usbwatch` 启动后自杀。** 它用 `airweb` 的 `/power` 接口探测服务是否就绪，
+但 `/power` 内部要连手机，手机不在 USB 上时返回 500。于是它等 120 秒后判定
+「airweb 没起来」，自己退出 —— 而它正是那个「等手机插上就开始干活」的进程。
+
+```
+2026-11-13 07:50:33 airweb 一直没起来，先退出
+```
+
+**2. 投屏成功后会断，断了没人重拉。** logcat 记录：
+
+```
+11-13 06:50:04 建立 → 06:55:04 销毁   5分00秒
+11-13 15:58:22 建立 → 16:03:22 销毁   5分00秒
+```
+
+`MediaProjectionManagerServiceStubImpl` + `Cancel FGS notification
+ChannelId:ScreenCaptureChannel` → 是 App 主动收尾（`onRelease`），非崩溃。
+但 08:20 那次超过 6 分钟没断，说明**不是豆包硬性 5 分钟上限**，
+更像通话被挂断或手机侧清理。无论如何，断了必须能自动重来。
+
+### 三处改动
+
+**1. usbwatch 探测改 `/`，且永不自杀**
+
+```python
+# 旧：探测 /power，超时就 return 1 退出
+# 新：探测 /（永远 200，不碰设备），且无限等下去
+while True:
+    rc = curl ... url + "/"
+    if rc == "200": break
+    waited += 1; time.sleep(1)
+```
+
+理由：`oneshot + RemainAfterExit` 下进程死了 systemd 不管，绝不能自己退出。
+
+**2. 加投屏看门狗（`CAST_WATCH=1`）**
+
+新函数 `cast_owner_now()` 只跑一次 `dumpsys display | grep ScreenCapture`
+取 owner，几百毫秒，不截图不问模型（守护循环不能烧钱）。
+
+主循环每 `CAST_CHECK_EVERY`（默认 20 秒）查一次；之前在投屏、现在 owner 空 →
+`rearm("掉线重拉")` 重跑整轮。抽了内部函数 `rearm(reason)` 统一更新
+`last_run` / `cast_up` / `next_cast_check`，避免「流程说成功但 owner 已空」的假状态。
+
+实测（手动 `am force-stop com.larus.nova` 模拟被清理）：
+
+```
+08:26:24 投屏不在了（owner 空），重新拉起
+08:26:26 >>> 掉线重拉
+08:27:21 流程结束：全部通过  9/9 步通过（轮次 1）
+```
+
+2 秒发现，55 秒恢复。
+
+**3. 一个 oneshot 拆成三个常驻服务**
+
+原来 airweb / usbwatch / smartcast 全塞在 `airtest-autocast.service` 里
+（`Type=oneshot` + `RemainAfterExit=yes`）—— 进程死了 systemd 不管，
+这正是「服务显示 active 但实际已死」的根因。
+
+现在（全部 `Restart=always`、`RestartSec=5`、`enabled`、`multi-user.target`）：
+
+| 单元 | ExecStart | 依赖 |
+|---|---|---|
+| `airtest-airweb.service` | `.venv/bin/python ./airweb.py 8123` | `After=network-online.target airtest-timesync.service` |
+| `airtest-smartcast.service` | `./smartcast.py --serve 8130` | `Requires=airtest-airweb.service` |
+| `airtest-usbwatch.service` | `./usbwatch.py`（`CAST_WATCH=1`） | `After=… airtest-airweb.service` |
+
+`start-all.sh` 里启动 usbwatch 那一步已注释掉，改由独立服务拉起；
+旧的 `airtest-autocast.service` 已 `disable`（否则开机会抢 8123 端口）。
+
+崩溃自愈实测：`kill -9` 掉 usbwatch → systemd 5 秒内拉起新 pid，
+`systemctl show -p NRestarts` = 2。
+
+### 两个 unit 文件配置坑（已修）
+
+1. **`StartLimitIntervalSec=0` 必须放 `[Unit]` 段**，放 `[Service]` 会被
+   systemd 245 静默忽略（`systemd-analyze verify` 报 `Unknown key name`）。
+   后果：重启次数上限实际生效，连续崩溃后 systemd 会彻底放弃拉起。
+2. `airtest-usbwatch.service` 的 `After=` 里残留了已 disable 的
+   `airtest-autocast.service`，已删。
+
+现在 `systemd-analyze verify` 对三个 airtest 单元无告警。
+
+### 小米 ROM 上判断投屏的正确方式
+
+**`dumpsys media_projection` 返回 `null`，不能用它判断。** 要用：
+
+```bash
+adb shell "dumpsys display | grep ScreenCapture"
+# → DisplayDeviceInfo{"ScreenCapture": ..., state ON, owner com.larus.nova (uid 10231), ...}
+```
+
+`smartcast.casting_owner()` 用的就是这个，正确。
+
+### 冷启动实测（2026-11-13 08:34）
+
+`systemd-run --on-active=5 systemctl reboot` 让板子真重启（脱离 exec 会话，
+避免重启命令被会话 SIGTERM 带走）。开机于 `08:34:53`，结果：
+
+```
+服务：airtest-airweb/smartcast/usbwatch/timesync  全部 active+enabled
+端口：8123、8130 正常监听
+HTTP：airweb / = 200；smartcast /health = {"ok": true, ...}
+日志：08:35:03 盯 USB 口 → 08:35:04 airweb 就绪 → 08:35:04 当前状态：没插
+```
+
+**服务层完全自动，无需人工登录。** 但手机 USB 又一次枚举失败：
+
+```
+[    8.559964] usb 2-1.3: device descriptor read/64, error -32
+[    8.899375] usb 2-1-port3: attempt power cycle
+[   11.352737] usb 2-1-port3: unable to enumerate USB device
+```
+
+`error -32` = EPIPE。软手段（`echo 0/1 > authorized` 重授权多轮）全部无效，
+只有**物理拔插**能恢复。这是硬件/供电层面问题，软件救不了。
+
+手机本身在 WiFi 上活着（`192.168.1.119` ping 通、ARP REACHABLE），
+但无线 adb 是关的（`persist.adb.tcp.port` 已清空，5555 `Connection refused`）。
+
+**结论**：若断电重启常犯 `error -32`，需硬件侧方案（带独立开关的 USB HUB，
+开机脚本先断电再上电），纯软件无解。
