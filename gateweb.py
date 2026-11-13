@@ -33,6 +33,7 @@ sys.path.insert(0, HERE)
 
 import gate  # noqa: E402
 import arb  # 前台仲裁状态
+import detail  # 细节点采集（豆包/直播两条链路）
 
 app = Flask(__name__)
 
@@ -106,6 +107,19 @@ PAGE = """<!doctype html>
 
 <div class="list" id="list"></div>
 
+<div id="pw" class="pw" style="display:none"></div>
+
+<div class="chain">
+  <div class="ch">
+    <div class="chh"><span class="cht">豆包 · 投屏链路</span><span class="chs" id="dbSum"></span></div>
+    <div class="grid" id="dbGrid"></div>
+  </div>
+  <div class="ch">
+    <div class="chh"><span class="cht">直播 · 推流链路</span><span class="chs" id="lcSum"></span></div>
+    <div class="grid" id="lcGrid"></div>
+  </div>
+</div>
+
 <div class="bar">
   <button onclick="act('pause')">全部暂停</button>
   <button onclick="act('resume')">全部恢复</button>
@@ -116,6 +130,29 @@ PAGE = """<!doctype html>
 
 <style>
 .arb{font-size:12px;color:#7a8595;margin:10px 0 4px;line-height:1.6}
+.pw{background:#3a2418;border:1px solid #6b4520;color:#ffb26b;
+    border-radius:10px;padding:10px 13px;font-size:13px;margin:16px 0 0;
+    line-height:1.55}
+.chain{margin:22px 0 6px}
+.ch{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:14px 16px;margin-bottom:12px}
+.chh{display:flex;justify-content:space-between;align-items:baseline;
+     margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+.cht{font-size:14px;font-weight:600;letter-spacing:.3px}
+.chs{font-size:12px;color:var(--dim)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:6px 14px}
+@media(max-width:520px){.grid{grid-template-columns:1fr}}
+.item{display:flex;align-items:center;gap:7px;font-size:13px;
+      padding:3px 0;min-width:0}
+.item .bd{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+.bd.on{background:var(--ok);box-shadow:0 0 6px rgba(46,204,113,.6)}
+.bd.off{background:var(--bad);box-shadow:0 0 6px rgba(231,76,60,.5)}
+.bd.na{background:#4a5263}
+.item .k{color:var(--dim);flex:0 0 auto}
+.item .v{color:var(--txt);overflow:hidden;text-overflow:ellipsis;
+         white-space:nowrap;font-variant-numeric:tabular-nums}
+.item .v.bad{color:var(--bad)}
+.item .v.good{color:var(--ok)}
 </style>
 <div class="foot">
   暂停是「就地让路」：服务进程不退出，只是每轮跳过动作，按一下 1 秒内生效。<br>
@@ -179,6 +216,45 @@ function render(s) {
     row.appendChild(dot); row.appendChild(meta); row.appendChild(sw);
     list.appendChild(row);
   }
+
+  renderChain('db', s.doubao || [], 'dbGrid', 'dbSum');
+  renderChain('lc', s.lens || [], 'lcGrid', 'lcSum');
+
+  // 手机卡住/探测熔断时，红点的一堆"没在跑"其实都是同一个原因，
+  // 不说明的话会误以为 App 崩了。
+  const warn = document.getElementById('pw');
+  if (warn) {
+    if (s.probe_down) {
+      warn.textContent = '⚠ ' + (s.probe_note || 'adb 探测超时，手机可能卡住了；点位不代表真实状态');
+      warn.style.display = 'block';
+    } else {
+      warn.style.display = 'none';
+    }
+  }
+}
+
+// 一条链路的所有细节点。灰点=信息项，红/绿=能判定成败的。
+function renderChain(prefix, rows, gridId, sumId) {
+  const g = document.getElementById(gridId);
+  if (!g) return;
+  g.innerHTML = '';
+  let bad = 0, tot = 0;
+  for (const r of rows) {
+    const it = el('div', 'item');
+    const d = el('div', 'bd ' + (r.ok === null ? 'na' : (r.ok ? 'on' : 'off')));
+    it.appendChild(d);
+    it.appendChild(el('span', 'k', r.label));
+    const v = el('span', 'v' + (r.ok === null ? '' : (r.ok ? ' good' : ' bad')), r.value);
+    v.title = r.label + '：' + r.value;
+    it.appendChild(v);
+    g.appendChild(it);
+    if (r.ok !== null) { tot++; if (!r.ok) bad++; }
+  }
+  const sum = document.getElementById(sumId);
+  if (sum) {
+    sum.textContent = bad === 0 ? (tot + ' 项全部正常') : (bad + '/' + tot + ' 项异常');
+    sum.style.color = bad === 0 ? 'var(--ok)' : 'var(--bad)';
+  }
 }
 
 async function load() {
@@ -232,6 +308,15 @@ def svc_state(name):
         return "unknown"
 
 
+def serial_for_detail():
+    """细节点要一个设备序列号。拿不到就返回空，detail 会自己降级。"""
+    try:
+        import smartcast
+        return smartcast.pick_serial()
+    except Exception:
+        return ""
+
+
 def build_status():
     s = gate.status()
     for ident, _, _ in DAEMONS:
@@ -246,6 +331,21 @@ def build_status():
         s["arb"] = arb.status()
     except Exception as e:
         s["arb"] = {"error": str(e)[:80]}
+
+    # 细节点：豆包投屏链路 + 直播推流链路。
+    # 采集会跑 adb，失败绝不能把整个 /api/status 拖挂，否则页面全白。
+    try:
+        det = detail.collect(serial_for_detail())
+        s["doubao"] = det.get("doubao", [])
+        s["lens"] = det.get("lens", [])
+        s["probe_at"] = det.get("at", "")
+        s["probe_age"] = det.get("age", 0)
+        s["probe_down"] = bool(det.get("probe_down"))
+        s["probe_note"] = det.get("probe_note", "")
+    except Exception as e:
+        s["doubao"] = []
+        s["lens"] = []
+        s["probe_error"] = str(e)[:120]
     return s
 
 

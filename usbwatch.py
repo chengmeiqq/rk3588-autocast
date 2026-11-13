@@ -338,6 +338,10 @@ def main():
     # 必须盯着 owner，没了就重新拉起。
     CAST_WATCH = os.environ.get("CAST_WATCH", "1") == "1"
     CAST_CHECK_EVERY = float(os.environ.get("CAST_CHECK_EVERY", "20"))
+    # 唯一条件：手机插着，豆包就该开着。
+    # 所以不管上一轮成没成，只要现在没在投屏就重来。间隔别太短，
+    # 否则一轮刚失败会在它自己的 60 秒里被反复打断。
+    CAST_RETRY_EVERY = float(os.environ.get("CAST_RETRY_EVERY", "30"))
     cast_up = False            # 我们认为现在应该在投屏吗
     next_cast_check = 0.0
 
@@ -345,12 +349,14 @@ def main():
         """跑一轮流程，并把 cast_up 更新成真实状态。"""
         nonlocal last_run, cast_up, next_cast_check
         log(">>> %s" % reason)
-        last_run = time.time()
         try:
             ok = run_flow()
         except Exception as e:
             log("跑流程出错: %s" % e)
             ok = False
+        # 冷却从「跑完」开始算，不是从「开跑」算。一轮要 60 秒，
+        # 从开跑算的话跑完时冷却早过期了，插拔时会立刻又跑一次。
+        last_run = time.time()
         cast_up = bool(cast_owner_now())
         next_cast_check = time.time() + CAST_CHECK_EVERY
         if ok and not cast_up:
@@ -389,12 +395,16 @@ def main():
                 if not cast_up:
                     log("投屏在线（owner %s）" % owner)
                 cast_up = True
-            elif cast_up:
-                # 刚才是好的，现在没了 —— 豆包 5 分钟限制到点。
-                log("投屏不在了（owner 空），豆包限量到点，重新拉起")
+            else:
+                # 之前这里写的是 elif cast_up（只在「曾经好过」时才重拉）。
+                # 漏洞：第一次就没成、或整轮三次都失败时 cast_up 一直是 False，
+                # 于是再也不会重试 —— 手机插着却一直没豆包。
+                # 用户的要求只有一个条件：插着就得开着。所以这里无条件守。
                 cast_up = False
-                time.sleep(2)
-                rearm("掉线重拉")
+                if time.time() - last_run >= CAST_RETRY_EVERY:
+                    log("插着但没在投屏（owner 空），重新拉起")
+                    time.sleep(2)
+                    rearm("没在投屏，重拉")
 
         time.sleep(0.25)
 
