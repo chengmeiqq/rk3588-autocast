@@ -1,0 +1,15 @@
+[Unit]
+Description=Airtest 守护总控台（网页开关四个自动守护）
+After=network-online.target airtest-adbd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/.openclaw/workspace/Airtest
+ExecStart=/root/.openclaw/workspace/Airtest/.venv/bin/python ./gateweb.py 8140
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

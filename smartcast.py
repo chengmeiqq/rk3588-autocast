@@ -30,6 +30,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG = os.path.expanduser("~/.openclaw/openclaw.json")
 APP = os.environ.get("PHONE_APP", "com.larus.nova")
+
+import gate  # 总开关（state/allow.json）
 TPL_DIR = os.path.join(HERE, "templates")
 SHOT = "/tmp/_cast_shot.png"
 RAW = "/tmp/_cast_raw.png"
@@ -502,6 +504,10 @@ def _open_cast(serial, step, wait_secs=16.0):
 CAST_LOCK = "/tmp/_cast.lock"
 
 
+class _Paused(Exception):
+    """流程中途被网页总开关叫停。"""
+
+
 def run(serial=None, tries=3, log=print):
     """完整投屏流程。
 
@@ -517,7 +523,14 @@ def run(serial=None, tries=3, log=print):
         except OSError:
             return {"ok": False, "why": "已有投屏流程在跑，本次让路",
                     "steps": []}
-        return _run_locked(serial=serial, tries=tries, log=log)
+        try:
+            return _run_locked(serial=serial, tries=tries, log=log)
+        except _Paused as e:
+            # 中途被网页总开关叫停：当正常结果返回，不抛给调用方，
+            # 否则 keepcast 会记一次"出错"，日志里看着像故障。
+            log("投屏流程被暂停叫停：%s" % e)
+            return {"ok": False, "why": "总开关已暂停，流程中断",
+                    "paused": True, "steps": []}
 
 
 def _run_locked(serial=None, tries=3, log=print):
@@ -527,6 +540,10 @@ def _run_locked(serial=None, tries=3, log=print):
     def step(m):
         rec["steps"].append(m)
         log(m)
+        # 每完成一步就检查总开关：用户在网页按暂停时，可能正好卡在一次
+        # 投屏流程中间。不能让它"按了暂停还继续点完"——那正是他最烦的弹窗。
+        if not gate.is_allowed("smartcast"):
+            raise _Paused("总开关已暂停，流程中断")
 
     # ── 第一步：USB 用途 ──
     # 插线后先放充电动画（约 15 秒），然后弹「USB 用于 / 仅限充电 / 传输文件」。
@@ -1003,6 +1020,12 @@ def serve(port=8130, log=None):
             elif p == "/do":
                 name = (q.get("step") or [None])[0]
             if name:
+                if not gate.is_allowed("smartcast"):
+                    return self._send(503, {
+                        "ok": False,
+                        "why": "守护已暂停（网页总开关），不执行 %s" % name,
+                        "paused": True,
+                    })
                 try:
                     raw_force = (q.get("force") or ["0"])[0]
                     r = do_step(name, serial=serial, log=out,
@@ -1013,6 +1036,14 @@ def serve(port=8130, log=None):
                 return self._send(200 if r.get("ok") else 500, r)
 
             if p == "/cast":
+                # 总开关：暂停时不接受投屏请求，否则网页调试期间
+                # 一条 curl 就能把投屏重新拉起来，白按暂停。
+                if not gate.is_allowed("smartcast"):
+                    return self._send(503, {
+                        "ok": False,
+                        "why": "守护已暂停（网页总开关），不执行投屏",
+                        "paused": True,
+                    })
                 try:
                     r = run(serial=serial, log=out)
                 except Exception as e:

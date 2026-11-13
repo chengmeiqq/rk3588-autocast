@@ -40,6 +40,8 @@ import smartcast                                    # noqa: E402
 STATE_DIR = os.path.join(HERE, "state")
 STATE = os.path.join(STATE_DIR, "keepcast.json")
 PAUSE = os.path.join(STATE_DIR, "keepcast.pause")
+
+import gate  # 总开关（state/allow.json）
 LOG = os.path.join(HERE, "logs", "keepcast.log")
 
 ADB = "/usr/lib/android-sdk/platform-tools/adb"
@@ -446,9 +448,11 @@ def main():
 
     while True:
         try:
-            if os.path.exists(PAUSE):
+            # 总开关：网页「暂停」按下后这里立刻让路，一条 adb 命令都不发。
+            # 兼容老的 state/keepcast.pause 标记（gate.is_allowed 内部判断）。
+            if not gate.is_allowed("keepcast"):
                 if was_ok is not False:
-                    log("已暂停（%s 存在），不动手" % os.path.basename(PAUSE))
+                    log("已暂停（网页总开关），不动手")
                     save_state(paused=True, ok=False, note="已暂停")
                     was_ok = False
                 time.sleep(CHECK_EVERY)
@@ -548,8 +552,14 @@ def main():
                 continue
 
         except Exception as e:
-            log("循环出错（继续跑）：%s" % e)
-            fails += 1
+            # 网页总开关中途叫停不是故障，别记成"出错"，否则看日志
+            # 会以为守护坏了。这种情况直接静默等下一轮。
+            if "总开关已暂停" in str(e):
+                fails = 0
+                log("已暂停（网页总开关），本轮放弃")
+            else:
+                log("循环出错（继续跑）：%s" % e)
+                fails += 1
 
         time.sleep(CHECK_EVERY)
 

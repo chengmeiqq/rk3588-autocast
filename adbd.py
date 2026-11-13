@@ -36,6 +36,8 @@ WIFI_IP = WIFI_ADDR.split(":")[0]
 LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                    "logs", "adbd.log")
 CHECK_EVERY = 20          # 秒
+
+import gate  # 总开关（state/allow.json）
 CONNECT_COOLDOWN = 60     # adb connect 失败后至少等这么久再试
 
 
@@ -94,6 +96,12 @@ def main():
 
     while True:
         try:
+            # 总开关：暂停期间只跳过"会打断你调试"的动作（WiFi 重连、
+            # 反复 start-server），但保留只读探测。
+            # 原因：这个进程负责把 adb 连接捡回来，USB 重新枚举时如果它也
+            # 完全冻住，等你解暂停时手机可能已经掉线很久了。
+            gated = not gate.is_allowed("adbd")
+
             d = devices()
             usb_ok = d.get(USB_SER) == "device" and ping(USB_SER)
             wifi_ok = (d.get(WIFI_ADDR) == "device" and ping(WIFI_ADDR))
@@ -109,8 +117,10 @@ def main():
                     log("两条腿都断了（adb devices: %s）" % (d or "空"))
                 prev = state
 
-            # USB 没了 -> 试着拉 WiFi 上来
-            if not wifi_ok and not usb_ok:
+            # USB 没了 -> 试着拉 WiFi 上来（暂停时不主动连，避免打断调试）
+            if gated:
+                pass
+            elif not wifi_ok and not usb_ok:
                 now = time.time()
                 if now - last_connect > CONNECT_COOLDOWN:
                     last_connect = now
@@ -120,8 +130,8 @@ def main():
                     else:
                         log("5555 端口不通（手机可能没开无线调试或断网）")
 
-            # adb server 自己挂了的兜底
-            if not d:
+            # adb server 自己挂了的兜底（暂停时不动，免得打断你正在跑的 adb）
+            if not d and not gated:
                 adb("start-server", timeout=20)
 
         except Exception as e:

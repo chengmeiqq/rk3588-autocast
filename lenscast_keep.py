@@ -42,6 +42,37 @@ import keepcast                                     # noqa: E402  (复用 usb_pr
 STATE_DIR = os.path.join(HERE, "state")
 STATE = os.path.join(STATE_DIR, "lenscast.json")
 PAUSE = os.path.join(STATE_DIR, "lenscast.pause")
+
+import gate  # 总开关（state/allow.json）
+
+# keepcast 跑投屏流程时会锁住这个文件（smartcast.CAST_LOCK）。
+# 拿到锁 = 没人投屏；拿不到 = 正在投屏。
+CAST_LOCK = "/tmp/_cast.lock"
+
+
+def cast_in_progress():
+    """投屏流程是否正在跑。这是"让路"的唯一依据。
+
+    为什么必须让：点「共享屏幕」之后豆包会弹系统授权框，那一刻前台
+    必然是 com.larus.nova。我们要是在这时候把直播画面顶回去，授权框
+    就被切走了，keepcast 下一刀点在空气上，整轮投屏白费——实测反复
+    出现，投屏永远起不来。
+
+    要和"投屏是否已建立"配合：流程结束（锁释放）且投屏成功时，前台
+    会被 keepcast 按 HOME 切到桌面，那时候直播画面必须顶回来。
+    """
+    import fcntl
+    try:
+        with open(CAST_LOCK, "w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f, fcntl.LOCK_UN)
+                return False
+            except OSError:
+                return True
+    except Exception:
+        return False
+
 LOG = os.path.join(HERE, "logs", "lenscast.log")
 
 ADB = "/usr/lib/android-sdk/platform-tools/adb"
@@ -358,7 +389,11 @@ def main():
 
     while True:
         try:
-            if os.path.exists(PAUSE):
+            # 总开关：暂停时完全不动手（网页上按一下立刻生效）
+            if not gate.is_allowed("lenscast"):
+                if last_ok is not False:
+                    save_state(ok=False, note="已暂停（网页总开关）")
+                    last_ok = False
                 time.sleep(CHECK_EVERY)
                 continue
 
@@ -389,11 +424,16 @@ def main():
                         log("屏幕叫不醒（可能锁屏），本轮跳过")
                     fg = foreground(serial)
                     if PKG not in fg:
-                        was = fg or "未知"
-                        bring_to_front(serial)
-                        time.sleep(2)
-                        fg = foreground(serial)
-                        log("直播画面被切到后台（前台原来是 %s），已顶回前台" % was)
+                        if cast_in_progress() and not smartcast.casting_owner(serial):
+                            # 投屏正在走授权流程，前台是豆包属于正常现象，
+                            # 这时候顶回直播画面会打断授权弹窗。让路。
+                            log("投屏流程进行中（前台 %s），本次不顶前台，让路" % (fg or "未知"))
+                        else:
+                            was = fg or "未知"
+                            bring_to_front(serial)
+                            time.sleep(2)
+                            fg = foreground(serial)
+                            log("直播画面被切到后台（前台原来是 %s），已顶回前台" % was)
                     if last_ok != "healthy":
                         log("直播正常（%s %s 帧%dKB）" % (
                             st.get("selectedCameraLabel"), st.get("selectedResolution"),
@@ -415,7 +455,7 @@ def main():
                 log(note)
                 # 新拉起的进程默认在前台，但 keepcast 可能刚按过 HOME，
                 # 这里补一刀确保画面落在豆包看得见的位置。
-                if PKG not in foreground(serial):
+                if PKG not in foreground(serial) and not cast_in_progress():
                     bring_to_front(serial)
                     log("已把直播画面切到前台")
                 last_ok = "healthy"
