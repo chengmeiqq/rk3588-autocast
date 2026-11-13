@@ -1,0 +1,87 @@
+# taskerd.sh —— 手机侧 Tasker 守护（Magisk service.d）
+
+## 为什么用 Magisk 而不是 Termux
+
+Termux 是个**普通 app**，它自己就是 MIUI SmartPower 的头号目标。
+
+实测对比（同一台手机）：
+
+| | oom_score_adj | 后果 |
+|---|---|---|
+| taskerd（root shell） | **-1000** | LMK 永不选它，MIUI 杀 app 的路径碰不到 |
+| Tasker（app） | **700** | 首选清理目标 |
+
+而且 Termux 这条路还要额外满足：装 Termux:Boot（未装）、装 tsu（未装）、
+常驻前台通知、手动关掉电池优化。即使全做到，Termux 仍是 app，
+MIUI 升级一次就可能重新被杀——等于把看门狗建在同一个不牢的地基上。
+
+service.d 里跑的是 root shell，**不是 app 进程**，这才是关键差别。
+
+## 安装
+
+```bash
+adb push scripts/taskerd.sh /data/local/tmp/taskerd.sh
+adb shell su -c 'cp /data/local/tmp/taskerd.sh /data/adb/service.d/taskerd.sh && chmod 755 /data/adb/service.d/taskerd.sh'
+```
+
+装完不用重启也能立刻生效（手工起一份）：
+
+```bash
+adb shell su -c 'nohup sh /data/adb/service.d/taskerd.sh >/dev/null 2>&1 &'
+```
+
+## 运维
+
+```bash
+# 看日志
+adb shell su -c 'tail -20 /data/local/tmp/taskerd.log'
+
+# 看进程
+adb shell su -c 'ps -p $(cat /data/local/tmp/taskerd.pid)'
+
+# 停掉（会一直停到下次开机）
+adb shell su -c 'kill $(cat /data/local/tmp/taskerd.pid)'
+
+# 改检查间隔（默认 15 秒）
+adb shell su -c 'TASKERD_INTERVAL=30 nohup sh /data/adb/service.d/taskerd.sh &'
+```
+
+## 设计要点
+
+- **单实例**：`/data/local/tmp/taskerd.pid` 存 pid，启动时比对 `cmdline`
+  含不含 `taskerd`，已有则直接退出。避免 service.d 重复执行叠出多个循环。
+- **等 boot_completed**：service.d 的执行时机比 `sys.boot_completed=1` 早，
+  这时 `am` 可能还不可用，所以先轮询最多 240 秒。
+- **拉起后回查**：`am start` 返回成功不代表进程起来了，5 秒后回查 `pidof`，
+  没有再记一笔，便于事后判断是"没拉"还是"拉了没活"。
+- **日志自限**：超 2000 行砍到后 1000 行，不会把 /data 撑爆。
+
+## 实测数据（2026-11-13）
+
+- 拉起耗时：2s / 9s / 7s / 12s（连续四次 `am force-stop`）
+- 守护进程自身：`PPID=1`、`oom_score_adj=-1000`，全程未受影响
+- 单实例保护：第二次启动立即打印「已有实例 pid=15029，nohup 退出」
+
+## 开机自启实测（2026-11-13 13:29）
+
+手机 `adb reboot` 后：
+
+```
+21:29:06  taskerd 启动 pid=2468（间隔 15s）      ← 无人手动启动
+21:29:14  系统就绪，开始看守
+21:29:14  Tasker 不在，第 1 次拉起              ← 开机时 Tasker 还没起
+21:29:19  已拉起（pid=6626）
+```
+
+进程身份直接证明来源：
+
+```
+2468 /debug_ramdisk/.magisk/busybox/busybox sh /data/adb/service.d/taskerd.sh
+```
+
+是 **Magisk 的 busybox** 拉起的，不是 adb shell。重启后再测 `am force-stop`，
+9 秒复活。
+
+顺带验证到：手机新 boot_id `69a90249-...`，板子侧 keepcast 在 13:29:10
+自动识别到「手机重启过」，重新执行了 USB 框 receiver 禁用——
+整条自愈链闭合。
