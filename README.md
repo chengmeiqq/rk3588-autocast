@@ -77,7 +77,17 @@ USB 设备节点不在（读 sysfs，不发 adb）→ 待命。**拔了线就完
    端口还 LISTEN，所以「进程在」不能当健康判据，必须真抓一帧。
 
 健康判据：state 里五项参数对上（含 `focusMode==auto` 与 `zoomValue≈1.53`）
-+ `streaming=true` + 抓帧 ≥ 20KB。
++ `streaming=true` + 抓帧 ≥ 20KB + **直播画面在前台** + **屏幕亮着**。
+
+后两条是「让豆包时刻看得见」这条需求带出来的，缺一个豆包就看不到画面：
+
+- **前台**：豆包共享的是「手机屏幕」。keepcast 每次投屏成功都会按 HOME
+  回桌面（`smartcast.py` 那句 `KEYCODE_HOME`），直播 App 一退到后台，
+  豆包看到的就是桌面。所以每轮都查 `topResumedActivity`，不在前台就叫回。
+- **亮屏**：屏幕灭掉时共享出去是纯黑。插着 USB 本来就该常亮
+  （`stay_on_while_plugged_in=7`、`screen_off_timeout=600000`），但 MIUI
+  的省电策略会插手，所以每轮实测 `mWakefulness`，灭了就 WAKEUP 并
+  dismiss-keyguard。实测 `Dozing` → `Awake` 且前台保持直播画面。
 抓帧走 `/snapshot.jpg` 的 302 跳转（不跟随就只拿到空 body）。
 
 ### 为什么是「双判据」而不是看进程

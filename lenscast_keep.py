@@ -154,6 +154,77 @@ def start_app(serial):
         return False
 
 
+def foreground(serial):
+    """当前前台 Activity 全名。读不到返回 ""。"""
+    try:
+        p = subprocess.run(
+            [ADB, "-s", serial, "shell",
+             "dumpsys activity activities | grep topResumedActivity | head -1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        out = p.stdout.decode("utf-8", "replace")
+        if "u0 " in out:
+            return out.split("u0 ", 1)[1].split()[0]
+        return ""
+    except Exception:
+        return ""
+
+
+def awake_state(serial):
+    """返回 'Awake' / 'Asleep' / 'Dozing' / ''（读不到）。"""
+    try:
+        p = subprocess.run(
+            [ADB, "-s", serial, "shell",
+             "dumpsys power | grep -o 'mWakefulness=[A-Za-z]*' | head -1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        out = p.stdout.decode("utf-8", "replace").strip()
+        return out.split("=", 1)[1] if "=" in out else ""
+    except Exception:
+        return ""
+
+
+def ensure_awake(serial):
+    """屏幕必须亮着，否则豆包看到的是黑屏。
+
+    用户要的是「时刻在直播画面」——投屏共享的是屏幕内容，屏幕一灭
+    共享出去就是一片黑。插着 USB 时系统本来就该常亮
+    （stay_on_while_plugged_in=7），但 MIUI 的省电策略会插手，
+    所以每轮都实测一次，灭了就叫醒并解锁。
+    返回 True 表示现在亮着。
+    """
+    st = awake_state(serial)
+    if st == "Awake":
+        return True
+    try:
+        subprocess.run([ADB, "-s", serial, "shell", "input keyevent KEYCODE_WAKEUP"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        time.sleep(1.0)
+        # 有锁屏就划开：上滑 + 确认无密码
+        subprocess.run([ADB, "-s", serial, "shell", "wm dismiss-keyguard"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        time.sleep(1.0)
+    except Exception:
+        return False
+    now = awake_state(serial)
+    return now == "Awake"
+
+
+def bring_to_front(serial):
+    """把全镜直播的预览画面切回前台。
+
+    为什么要这一步：豆包的投屏流程在成功后会把手机按回桌面
+    （smartcast.py 里那句 KEYCODE_HOME），而豆包共享的是「手机屏幕」。
+    直播 App 一旦退到后台，豆包看到的就是桌面，不是摄像头画面 ——
+    用户要的是「豆包时刻能看直播画面」，所以这里要把它顶回前台。
+    """
+    try:
+        subprocess.run([ADB, "-s", serial, "shell", "am start -n " + ACT],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=25)
+        return True
+    except Exception:
+        return False
+
+
 def crash_reason(serial):
     """最近的崩溃原因。这句 `disabled by policy` 是实测遇到的真实故障。"""
     try:
@@ -309,6 +380,20 @@ def main():
             if st and st.get("streaming") and params_ok(st):
                 size = frame_size()
                 if size >= MIN_FRAME:
+                    # 参数和画面都对，还要确认画面「在豆包看得见的地方」。
+                    # 豆包共享的是手机屏幕：直播 App 退到后台，豆包看到的就是
+                    # 桌面。keepcast 每次投屏成功都会按 HOME 回桌面，所以这里
+                    # 发现不在前台就顶回去。
+                    # 屏幕灭着的话豆包看到的是黑屏，先叫醒
+                    if not ensure_awake(serial):
+                        log("屏幕叫不醒（可能锁屏），本轮跳过")
+                    fg = foreground(serial)
+                    if PKG not in fg:
+                        was = fg or "未知"
+                        bring_to_front(serial)
+                        time.sleep(2)
+                        fg = foreground(serial)
+                        log("直播画面被切到后台（前台原来是 %s），已顶回前台" % was)
                     if last_ok != "healthy":
                         log("直播正常（%s %s 帧%dKB）" % (
                             st.get("selectedCameraLabel"), st.get("selectedResolution"),
@@ -319,7 +404,8 @@ def main():
                                resolution=st.get("selectedResolution"),
                                quality=st.get("qualityValue"),
                                focus=st.get("focusMode"),
-                               zoom=st.get("zoomValue"), why="")
+                               zoom=st.get("zoomValue"),
+                               front=(fg if PKG in fg else "已切回"), why="")
                     fails = 0
                     time.sleep(CHECK_EVERY)
                     continue
@@ -327,6 +413,11 @@ def main():
             ok, note = bring_up(serial)
             if ok:
                 log(note)
+                # 新拉起的进程默认在前台，但 keepcast 可能刚按过 HOME，
+                # 这里补一刀确保画面落在豆包看得见的位置。
+                if PKG not in foreground(serial):
+                    bring_to_front(serial)
+                    log("已把直播画面切到前台")
                 last_ok = "healthy"
                 fails = 0
                 save_state(ok=True, serial=serial, note=note, why="")
