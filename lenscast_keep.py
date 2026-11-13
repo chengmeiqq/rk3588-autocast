@@ -15,7 +15,8 @@
 目标参数（用户指定，实测可达 3840x2160）：
   摄像头 后摄 3   camera=0
   分辨率 3840x2160
-  对焦   1.53     focusDistance=1.53（需先切 manual）
+  对焦   自动     focus=auto
+  变焦   1.53     zoom=1.53
   推流质量 100%
   开始直播
 
@@ -57,8 +58,9 @@ WANT = {
     "camera": "0",             # 后摄 3（logical 0）
     "resolution": "3840x2160",
     "quality": "100",
-    "focusDistance": "1.53",
+    "zoom": "1.53",            # 变焦（不是对焦距离）
 }
+WANT_FOCUS_MODE = "auto"       # 对焦交给相机自己，不手动锁距离
 WANT_FPS = "30"
 
 # 判活阈值：一帧 4K JPEG 至少几百 KB，小于这个数当没出图
@@ -183,6 +185,13 @@ def frame_size():
         return 0
 
 
+def _num_eq(a, b, tol=0.01):
+    try:
+        return abs(float(a) - float(b)) < tol
+    except (TypeError, ValueError):
+        return False
+
+
 def params_ok(st):
     """关键参数是否已经等于目标值。"""
     if st is None:
@@ -190,13 +199,13 @@ def params_ok(st):
     return (st.get("selectedCameraKey") == WANT["camera"]
             and st.get("selectedResolution") == WANT["resolution"]
             and st.get("qualityValue") == int(WANT["quality"])
-            and st.get("focusMode") == "manual"
-            and abs(float(st.get("focusDistanceValue") or -1) - float(WANT["focusDistance"])) < 0.01)
+            and st.get("focusMode") == WANT_FOCUS_MODE
+            and _num_eq(st.get("zoomValue"), WANT["zoom"]))
 
 
 def apply_params(st):
     """按目标值设参数。顺序有意义：
-    先切 manual 再设 focusDistance —— auto 模式下这个值会被相机覆盖。
+    先设对焦模式再设变焦 —— 改 zoom 会触发相机重新对焦。
     分辨率要在 camera 之后设：换镜头会重置可选分辨率列表。
     """
     if st.get("selectedCameraKey") != WANT["camera"]:
@@ -208,18 +217,19 @@ def apply_params(st):
     if st.get("qualityValue") != int(WANT["quality"]):
         ctl(quality=WANT["quality"])
         time.sleep(0.5)
-    # 参数名是 focus，不是 focusMode —— 这是 App 的 API 命名，写错了不报错，
-    # 只是静默不生效（实测踩过：传 focusMode=manual 返回 ok:true 但模式不变，
-    # 于是 focusDistanceSupported 一直是 false，对焦永远设不上）。
-    # 切到 manual 后必须重读 state：auto 模式下 App 不报 focusDistanceValue。
-    if st.get("focusMode") != "manual":
-        ctl(focus="manual")
+    # 对焦模式：用户要「自动」，交给相机自己，不锁距离。
+    # 参数名是 focus 不是 focusMode —— 这是 App 的 API 命名，写错了不报错，
+    # 只是静默不生效（实测踩过：传 focusMode=manual 返回 ok:true 但模式不变）。
+    if st.get("focusMode") != WANT_FOCUS_MODE:
+        ctl(focus=WANT_FOCUS_MODE)
         time.sleep(1.2)
         st = get_state() or {}
-    cur = st.get("focusDistanceValue")
-    if cur is None or abs(float(cur) - float(WANT["focusDistance"])) >= 0.01:
-        ctl(focusDistance=WANT["focusDistance"])
-        time.sleep(0.6)
+    # 变焦：参数名是 zoom。注意别和对焦距离（focusDistance）搞混 ——
+    # 两者都接受 1.53，但 zoom 是画面放大倍数，focusDistance 是镜头到焦面距离。
+    # 改 zoom 会触发相机重新对焦，所以放在对焦模式之后。
+    if not _num_eq(st.get("zoomValue"), WANT["zoom"]):
+        ctl(zoom=WANT["zoom"])
+        time.sleep(0.8)
         st = get_state() or {}
     return st
 
@@ -262,15 +272,16 @@ def bring_up(serial):
             return False, "抓帧时崩溃：%s" % crash_reason(serial)
         return False, "无画面（%d 字节）" % size
 
-    return True, "直播中 %s %s 质量%s 对焦%s 帧%dKB" % (
+    return True, "直播中 %s %s 质量%s 对焦%s 变焦%s 帧%dKB" % (
         st.get("selectedCameraLabel"), st.get("selectedResolution"),
-        st.get("qualityValue"), st.get("focusDistanceValue"), size // 1024)
+        st.get("qualityValue"), st.get("focusMode"),
+        st.get("zoomValue"), size // 1024)
 
 
 def main():
-    log("lenscast 守护启动（间隔 %.0fs，目标 %s / %s / 质量%s / 对焦%s）" % (
-        CHECK_EVERY, WANT["camera"], WANT["resolution"],
-        WANT["quality"], WANT["focusDistance"]))
+    log("lenscast 守护启动（间隔 %.0fs，目标 %s / %s / 质量%s / 对焦%s / 变焦%s）"
+        % (CHECK_EVERY, WANT["camera"], WANT["resolution"],
+           WANT["quality"], WANT_FOCUS_MODE, WANT["zoom"]))
     fails = 0
     last_ok = None
 
@@ -307,7 +318,8 @@ def main():
                                camera=st.get("selectedCameraLabel"),
                                resolution=st.get("selectedResolution"),
                                quality=st.get("qualityValue"),
-                               focus=st.get("focusDistanceValue"), why="")
+                               focus=st.get("focusMode"),
+                               zoom=st.get("zoomValue"), why="")
                     fails = 0
                     time.sleep(CHECK_EVERY)
                     continue

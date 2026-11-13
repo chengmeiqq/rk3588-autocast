@@ -58,22 +58,26 @@ USB 设备节点不在（读 sysfs，不发 adb）→ 待命。**拔了线就完
 | 摄像头 | 后摄 3 | `camera=0` |
 | 分辨率 | 3840x2160 | `resolution=3840x2160` |
 | 推流质量 | 100% | `quality=100` |
-| 对焦 | 1.53 | `focus=manual` 后 `focusDistance=1.53` |
+| 对焦 | 自动 | `focus=auto` |
+| 变焦 | 1.53 | `zoom=1.53` |
 | 开始直播 | — | `streaming=true` |
+
+**别把「变焦 1.53」和「对焦距离 1.53」搞混**（我搞混过一次）：
+两个接口参数都叫得进 1.53，`zoom` 是画面放大倍数，`focusDistance` 是镜头到
+焦面的物理距离。用户说「变焦 1.53」时指的是前者，对焦模式要留 `auto`。
 
 三个踩过的坑，都写进代码注释了：
 
 1. **参数名是 `focus` 不是 `focusMode`**。传 `focusMode=manual` 会返回
    `{"ok":true}` 但静默不生效，`focusDistanceSupported` 一直是 `false`，
-   对焦永远设不上。真正生效的是 `focus=manual`（见 `dashboard.js` 的
-   `params.set('focus', ...)`）。
-2. **切 manual 后必须重读 state**。auto 模式下 App 不报 `focusDistanceValue`，
-   拿旧对象判空会以为「值已经对了」。
+   对焦永远设不上。真正生效的是 `focus=manual` / `focus=auto`。
+2. **改 zoom 会触发相机重新对焦**，所以要先设 `focus` 再设 `zoom`，反了就白设。
 3. **4K@100% 时 App 的 HTTP 服务会死锁**。实测连续 70 秒零响应，手机本地
    loopback 也不通，CPU 却是 0%——是服务线程卡死，不是负载。进程还活着、
    端口还 LISTEN，所以「进程在」不能当健康判据，必须真抓一帧。
 
-健康判据：state 里五项参数对上 + `streaming=true` + 抓帧 ≥ 20KB。
+健康判据：state 里五项参数对上（含 `focusMode==auto` 与 `zoomValue≈1.53`）
++ `streaming=true` + 抓帧 ≥ 20KB。
 抓帧走 `/snapshot.jpg` 的 302 跳转（不跟随就只拿到空 body）。
 
 ### 为什么是「双判据」而不是看进程
