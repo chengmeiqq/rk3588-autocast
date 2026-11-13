@@ -103,7 +103,14 @@ def _cfg():
         return json.load(f)["models"]["providers"]["qiniu"]
 
 
-def _adb(serial, *args, timeout=25):
+def _adb(serial, *args, timeout=10):
+    """跑一条 adb。硬超时，绝不让挂死的客户端堆在板上。
+
+    25 秒太长了：这台机的 system_server 卡住时 dumpsys 会无限等 binder，
+    页面又在轮询，几轮下来就攒出十几个挂死的 adb，把通道彻底堵死，
+    连 echo 都不返回（已真实发生过，最后只能重启手机）。10 秒够快命令
+    用，卡住也能及时放手。
+    """
     try:
         return subprocess.run([ADB, "-s", serial] + list(args),
                               capture_output=True, text=True,
@@ -362,8 +369,11 @@ def _enter_call(serial, step):
     NAME = "打电话"
     for i in range(1, 4):
         # ── 1. 无障碍树 ──
+        # 先按 resource-id 认「打电话」按钮：rid 是系统给的唯一标识，
+        # 不怕输入框里残留同名文字（踩过：残留「打电话」把光标点进输入框，
+        # 页面卡在「修改」编辑态，投屏永远起不来）
         ns = uitap.dump(serial)
-        hit = uitap.find(ns, NAME)
+        hit = uitap.find(ns, rid="real_time_call") or uitap.find(ns, NAME)
         if hit:
             n = hit[0]
             step("第%d轮：无障碍树找到「%s」@(%d,%d) bounds=%s"
@@ -876,7 +886,9 @@ def do_step(name, serial=None, log=print, force=False):
         hit = None
         for i in range(4):
             ns = uitap.dump(serial)
-            hit = uitap.find(ns, "打电话")
+            # 先按 id 认（首页那颗电话自己有 content-desc，但父容器才有 id）；
+            # 认不到才退回按文字，且 uitap.find 已默认跳过输入框
+            hit = uitap.find(ns, rid="real_time_call") or uitap.find(ns, "打电话")
             if hit:
                 break
             time.sleep(1.2)
