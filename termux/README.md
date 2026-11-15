@@ -169,3 +169,46 @@ am force-stop com.opencode.multilensipcam   # 为了让豆包「占住相机」
 不要了。投屏 + 直播**同时**跑这一点已经验证通过，全部在手机内闭环。
 板子侧原有的 `keepcast` / `lenscast` / `smartcast`
 现在反而可能与手机上的守护抢前台，建议保持暂停（`state/allow.json` 里已置 false）。
+
+## 重启验证（已实测通过）
+
+`adb reboot` 后全程无人工干预，手机自己恢复：
+
+```
+13:22:04  Magisk 服务启动 pid=2340
+21:22:11  系统就绪（等 sys.boot_completed=1）
+21:22:19  守护不在，拉起
+21:22:19  守护启动
+21:22:30  点「打电话」@ 395 2084
+21:22:41  点「共享屏幕」@ 413 2117
+21:22:47  点「立即开始」@ 859 1515
+21:22:51  投屏已开
+21:22:51  直播拉前台
+21:23:02  并存 OK：投屏在，直播 569132B
+```
+
+重启后 96 秒的独立复核：
+
+```
+进程链:  root 2340  /data/adb/service.d/nova.sh
+         root 12398  └─ bash ./nova.sh watch
+前台:    com.opencode.multilensipcam/.MainActivity
+共享:    ScreenCaptureService isForeground=true
+相机:    Client Package Name: com.opencode.multilensipcam
+帧:      574351B / 575089B / 572566B   全 HTTP 200
+参数:    streaming=True 3840x2160 q100 zoom1.53
+```
+
+注意 `persist.adb.tcp.port=5555` 也保住了，但那已经不重要——
+整套流程不再依赖 adb。
+
+### 重启后手工恢复（万一）
+
+```sh
+# 手机内，Termux
+cd ~ && ./nova.sh status      # 看状态
+cd ~ && ./nova.sh once        # 手动跑一次
+cd ~ && ./nova.sh watch &     # 手动起守护
+```
+
+Magisk 服务每分钟自检，守护死了会自己重拉，通常不用管。
