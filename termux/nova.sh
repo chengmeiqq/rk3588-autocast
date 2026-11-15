@@ -113,6 +113,28 @@ ensure_lens() {
   return 1
 }
 
+# 当前前台 Activity（带包名/类名，已去掉尾巴）
+top_act() {
+  R "dumpsys activity activities" 2>/dev/null | grep -m1 topResumedActivity | sed 's/.*u0 //;s/}.*//;s/ *$//'
+}
+
+# 子 shell 里拿 UI 控件（find_ui 的轻量包装，只用一次 dump）
+su_ui() {
+  dump_ui >/dev/null 2>&1 || return 1
+  python3 -c '
+import sys, re, html
+want = sys.argv[1]
+for m in re.finditer(r"<node[^>]*/?>", open(sys.argv[2]).read()):
+    tag = m.group(0)
+    def attr(n):
+        mm = re.search(n + r"=\"([^\"]*)\"", tag)
+        return html.unescape(mm.group(1)) if mm else ""
+    if attr("text") == want or attr("content-desc") == want:
+        sys.exit(0)
+sys.exit(1)
+' "$1" "$UIDUMP" 2>/dev/null
+}
+
 # ---------- 投屏检测 ----------
 # 不能用 UI dump：豆包在后台时它的界面不在 UI 树里，会误判成「没投屏」。
 # 也不能查 dumpsys media_projection：它一直返回 null（实测）。
@@ -209,46 +231,87 @@ ensure_share() {
   R "am start -n $DOUBAO_ACT" >/dev/null
   sleep 6
 
-  if ! R "dumpsys activity activities" | grep -q "$DOUBAO"; then
-    say "豆包没起来"
-    return 1
-  fi
+  # 必须查前台，不能 grep activity activities——那个后台 task 也会命中
+  local i
+  for i in 1 2 3; do
+    case "$(top_act)" in
+      *"$DOUBAO"*) break ;;
+    esac
+    R "am start -n $DOUBAO_ACT" >/dev/null 2>&1
+    sleep 3
+  done
+  case "$(top_act)" in
+    *"$DOUBAO"*) ;;
+    *) say "豆包没起来（前台是 $(top_act)）"; return 1 ;;
+  esac
 
-  # 打电话
+  # 打电话 —— 点完必须确认通话页真的起来了
   local pt
   pt=$(find_ui "打电话")
   if [ -n "$pt" ]; then
     say "点「打电话」@ $pt"
     tap $pt
-    sleep 5
   else
     say "没找到「打电话」"
   fi
+  # 通话页判定：只认 RealtimeCallActivity。
+  # 不能用「立即开始」当信号——那是系统投屏授权弹窗的按钮，
+  # 弹窗盖住整个屏幕时 UI dump 只有弹窗，会误判成「通话页已起」。
+  local ok_call=0 j
+  for j in $(seq 1 10); do
+    case "$(top_act)" in
+      *RealtimeCallActivity*) ok_call=1; break ;;
+    esac
+    sleep 2
+  done
+  if [ "$ok_call" != "1" ]; then
+    pt=$(find_ui "打电话")
+    [ -n "$pt" ] && { say "通话页没起，再点一次 @ $pt"; tap $pt; }
+    for j in $(seq 1 8); do
+      sleep 2
+      case "$(top_act)" in
+        *RealtimeCallActivity*) ok_call=1; break ;;
+      esac
+    done
+  fi
+  [ "$ok_call" = "1" ] && say "通话页已起" || { say "通话页没起（前台 $(top_act)）"; return 1; }
 
-  # MIUI 权限弹窗可能挡着
-  local allow
-  allow=$(find_ui "允许")
-  [ -n "$allow" ] && { say "点「允许」@ $allow"; tap $allow; sleep 3; }
-
-  # 共享屏幕
-  pt=$(find_ui "共享屏幕")
+  # 共享屏幕。注意弹窗可能已经在屏幕上（盖住了通话页），
+  # 这时 UI dump 里根本没有「共享屏幕」，得先处理弹窗。
+  local pt k
+  if ! su_ui "立即开始" >/dev/null; then
+    pt=$(find_ui "共享屏幕")
+  fi
+  local tried_share=0
   if [ -n "$pt" ]; then
     say "点「共享屏幕」@ $pt"
     tap $pt
-    sleep 4
-  else
-    say "没有「共享屏幕」按钮"
+    tried_share=1
   fi
 
-  # 系统授权
-  pt=$(find_ui "立即开始")
-  [ -n "$pt" ] && { say "点「立即开始」@ $pt"; tap $pt; sleep 4; }
-
-  if sharing; then
-    say "投屏已开"
-    return 0
-  fi
-  say "投屏没开起来"
+  # 授权弹窗：标题「要开始使用豆包录制或投射内容吗？」按钮「立即开始」。
+  # 它可能立刻弹（此时 tried_share=1），也可能是上次没关掉的残留（tried_share=0）。
+  # 两种都得点，反复轮询直到投屏真的起来。
+  local sp clicked_last=0
+  for k in $(seq 1 12); do
+    sharing && { say "投屏已开"; return 0; }
+    sp=$(find_ui "立即开始")
+    if [ -n "$sp" ]; then
+      say "点「立即开始」@ $sp"
+      tap $sp
+      clicked_last=1
+      sleep 3
+      continue
+    fi
+    # 既没投屏、也没弹窗：可能是按钮没找到、或界面还没到达
+    if [ "$tried_share" = "0" ]; then
+      pt=$(find_ui "共享屏幕")
+      [ -n "$pt" ] && { say "点「共享屏幕」@ $pt"; tap $pt; tried_share=1; sleep 2; continue; }
+    fi
+    sleep 2
+  done
+  sharing && { say "投屏已开"; return 0; }
+  say "投屏没开起来（前台 $(top_act)）"
   return 1
 }
 
