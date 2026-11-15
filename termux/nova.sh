@@ -114,10 +114,23 @@ ensure_lens() {
 }
 
 # ---------- 投屏检测 ----------
-# 不能查 dumpsys activity：那里没有「正在共享屏幕」这类文字，
-# 那是屏幕上的 UI 文本，只在 uiautomator 树里。
-# dumpsys media_projection 返回 null 也不代表没开（实测过）。
-# 所以：dump 一次 UI，看树里有没有「退出屏幕共享」这个按钮。
+# 不能用 UI dump：豆包在后台时它的界面不在 UI 树里，会误判成「没投屏」。
+# 也不能查 dumpsys media_projection：它一直返回 null（实测）。
+#
+# 可靠信号是豆包的前台服务：
+#   com.larus.nova/com.larus.flow.capture.screen.ScreenCaptureService
+#     isForeground=true
+# 只要在投屏它就活着，**跟哪个 App 占前台无关**。实测：投屏中 3 次，
+# 退出后 0 次。这也就是为什么「豆包后台投屏 + 直播前台」能同时成立。
+sharing() {
+  local n
+  n=$(R "dumpsys activity services $DOUBAO" 2>/dev/null | grep -c 'ScreenCaptureService')
+  [ "${n:-0}" -gt 0 ] 2>/dev/null
+}
+
+# uiautomator 树里按完全相等找控件，返回 "x y"
+# 必须完全相等：豆包的标题 text="正在共享屏幕" 含「共享屏幕」四字，
+# 用子串匹配会点中标题(y≈804)而不是按钮(y≈2117)。
 UIDUMP=$HOME/.nova/ui.xml
 
 dump_ui() {
@@ -126,21 +139,8 @@ dump_ui() {
   [ -s "$UIDUMP" ]
 }
 
-sharing() {
-  # 已有 dump 就先用，避免每次都 dump（dump 要 1-2 秒）
-  if [ ! -s "$UIDUMP" ] || [ -n "${1:-}" ]; then
-    dump_ui || return 1
-  fi
-  grep -q '退出屏幕共享' "$UIDUMP" 2>/dev/null
-}
-
-# uiautomator 树里按完全相等找控件，返回 "x y"
-# 必须完全相等：豆包的标题 text="正在共享屏幕" 含「共享屏幕」四字，
-# 用子串匹配会点中标题(y≈804)而不是按钮(y≈2117)。
 find_ui() {
-  if [ ! -s "$UIDUMP" ] || [ -n "${2:-}" ]; then
-    dump_ui || return 1
-  fi
+  dump_ui || return 1
   python3 -c '
 import sys, re, html
 want = sys.argv[1]
@@ -193,17 +193,17 @@ ensure_screen_on() {
 }
 
 ensure_share() {
-  if sharing fresh; then
+  if sharing; then
     say "已经在投屏，不动手"
     return 0
   fi
   ensure_network
   ensure_screen_on
 
-  # 关掉直播前台，让豆包能占住相机
+  # 不要让直播 App force-stop：它一死 API 就没了，而且重启后相机要重新初始化。
+  # 豆包的投屏流程不需要独占相机（实测流着的时候豆包在前台也不报错），
+  # 真要抢也是 联屏后再拉直播，不在这一步做。
   R "input keyevent KEYCODE_WAKEUP" >/dev/null
-  R "am force-stop $PKG" >/dev/null 2>&1
-  sleep 2
 
   say "拉起豆包"
   R "am start -n $DOUBAO_ACT" >/dev/null
@@ -244,7 +244,7 @@ ensure_share() {
   pt=$(find_ui "立即开始")
   [ -n "$pt" ] && { say "点「立即开始」@ $pt"; tap $pt; sleep 4; }
 
-  if sharing fresh; then
+  if sharing; then
     say "投屏已开"
     return 0
   fi
@@ -252,14 +252,70 @@ ensure_share() {
   return 1
 }
 
-# ---------- 模式 ----------
-mode_lens() {
-  # 投屏开着就让路：抢前台会打断投屏，且 MIUI 相机只给前台
-  if sharing fresh; then
-    say "投屏进行中，直播让路"
+# ---------- 共存模式 ----------
+#
+# 关键认识（之前搞错了）：不需要在「投屏」和「直播」之间二选一。
+# 正确顺序是：先在豆包里开屏幕共享，再把直播 App 拉前台。
+#
+# 豆包的屏幕共享跑在 ScreenCaptureService（前台服务）里，
+# 切到后台不影响；直播 App 占了前台就能拿相机。
+# 于是豆包看得到直播画面，直播也不断流。
+#
+# 实测：直播前台 + 豆包后台投屏 → 帧 564544B HTTP 200，
+#       ScreenCaptureService isForeground=true 仍在。
+
+# 把直播拉前台（不碰豆包的投屏）
+promote_lens() {
+  local top
+  top=$(R "dumpsys activity activities" | grep -m1 topResumedActivity)
+  case "$top" in
+    *"$PKG"*) return 0 ;;
+  esac
+  say "直播拉前台"
+  R "am start -n $ACT" >/dev/null 2>&1
+  sleep 3
+  top=$(R "dumpsys activity activities" | grep -m1 topResumedActivity)
+  case "$top" in
+    *"$PKG"*) return 0 ;;
+  esac
+  return 1
+}
+
+mode_both() {
+  # 1) 投屏先开（豆包得在前台才能操作）
+  if ! ensure_share; then
+    say "投屏没搞成，只保直播"
+    promote_lens
+    ensure_lens
+    return 1
+  fi
+  # 2) 立刻把直播拉前台；豆包的 ScreenCaptureService 在后台继续跑
+  promote_lens
+  sleep 2
+  # 3) 直播参数 + 出图
+  ensure_lens
+  # 4) 确认两边同时成立
+  local ok_share=0 ok_lens=0 f sz cd
+  sharing && ok_share=1
+  f=$(curl -sL -m 15 -o /dev/null -w '%{size_download} %{http_code}' "$API/snapshot.jpg")
+  sz=${f%% *}; cd=${f##* }
+  [ "${cd:-000}" = "200" ] && [ "${sz:-0}" -gt 10000 ] 2>/dev/null && ok_lens=1
+  if [ "$ok_share" = "1" ] && [ "$ok_lens" = "1" ]; then
+    say "并存 OK：投屏在，直播 ${sz}B"
     return 0
   fi
-  ensure_lens
+  say "状态：投屏=$ok_share 直播=$ok_lens (${f:-无响应})"
+  return 1
+}
+
+mode_lens() {
+  if sharing; then
+    # 投屏已在（可能豆包在前台）。把直播拉前台，两边都要
+    promote_lens
+    ensure_lens
+    return $?
+  fi
+  mode_both || { say "回退：只保直播"; promote_lens; ensure_lens; }
 }
 
 status() {
@@ -268,7 +324,7 @@ status() {
   echo "前台:       $(R 'dumpsys activity activities' | grep -m1 topResumedActivity | sed 's/.*u0 //;s/}.*//')"
   echo "屏幕:       $(R 'dumpsys power' | grep -m1 mWakefulness= | sed 's/.*mWakefulness=//;s/,.*//')"
   echo "飞行:       $(R 'settings get global airplane_mode_on')"
-  echo "投屏:       $(sharing fresh && echo 开 || echo 关)"
+  echo "投屏:       $(sharing && echo 开 || echo 关)"
   local st; st=$(api_state)
   if [ -n "$st" ]; then
     echo "直播:       $(echo "$st" | python3 -c 'import sys,json;d=json.load(sys.stdin);print("streaming=%s %s q%s zoom%s"%(d.get("streaming"),d.get("selectedResolution"),d.get("qualityValue"),d.get("zoomValue")))' 2>/dev/null)"
@@ -387,7 +443,7 @@ acquire_lock() {
 }
 
 case "${1:-watch}" in
-  once)   ensure_share; ensure_lens ;;
+  once)   mode_both ;;
   lens)   mode_lens ;;
   share)  ensure_share ;;
   status) status ;;

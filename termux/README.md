@@ -43,7 +43,7 @@ $ curl -s -X POST "http://127.0.0.1:41737/api/control?resolution=3840x2160&quali
 用法：
 
 ```sh
-./nova.sh once      # 投屏 + 直播各一次
+./nova.sh once      # 投屏 + 直播（豆包后台投屏，直播前台）
 ./nova.sh lens      # 只保直播（参数 + 出图）
 ./nova.sh share     # 只做投屏
 ./nova.sh watch     # 常驻守护，20s 一轮
@@ -87,23 +87,65 @@ content-desc="共享屏幕"   ← 真按钮，bounds [308,2012][518,2222]  y≈2
 用 `grep -F "共享屏幕"` 做子串匹配会**先命中标题**，点下去毫无反应，
 日志却写「已点共享屏幕」——比直接报错更难查。必须完全相等，且优先 `clickable=true`。
 
-## ⚠ 硬限制：投屏和直播互斥，无法绕过
+## ✅ 投屏和直播可以同时跑（之前结论错了）
 
-MIUI 只允许**可见前台**的 App 用相机。实测对照：
+我以前写「投屏与直播互斥、无法绕过」——**错的**。不需要在两者之间选。
 
-| 前台 | `/snapshot.jpg` |
-|---|---|
-| 豆包通话页 | `0B / HTTP 000` |
-| 直播 App（在后台） | `23B / HTTP 503` |
-| 直播 App（干净前台） | `560671B / HTTP 200` ✅ |
+正确顺序：
 
-**试过分屏（`--windowingMode 3`）：结果是 `23B / HTTP 503`，投屏也断了。**
-两个 App 同时可见也救不了，这是相机独占，不是窗口问题。
+1. 先在豆包里开屏幕共享（这时豆包在前台）
+2. **再把直播 App 拉前台**
 
-所以 `watch` 默认走 `lens` 模式：检测到投屏在开就主动让路，不抢前台。
+豆包的屏幕共享跑在 `ScreenCaptureService` 这个**前台服务**里，
+切到后台不影响；而直播 App 占了前台就能拿到相机。
+于是豆包看得到直播画面，直播也不断流。
 
-⚠ 要提一点：实测中一度出现过 `owner=com.larus.nova` 且 `streaming=True`、
-帧约 1.51MB 的并存状态，之后没能复现。默认按互斥处理，因为那是可复现的常态。
+实测（独立复核，不靠脚本自报）：
+
+```
+前台:        com.opencode.multilensipcam/.MainActivity
+ScreenCaptureService  isForeground=true  uidState: TOP
+Camera client:  com.opencode.multilensipcam (PID 22728)
+帧:  571020B HTTP 200 / 570104B / 571990B
+参数:  3840x2160 q100 zoom1.53
+```
+
+也解释了早前那个没复现的 `owner=com.larus.nova` 且 `streaming=True`、
+1.51MB 的并存状态——那不是偶然，是正常行为。
+
+### 之前为什么误判成互斥
+
+两处错误叠在一起：
+
+**错误一：检测方法。** 我用 `uiautomator dump` 找「退出屏幕共享」。
+但 dump 只包含**当前前台 App** 的界面，豆包一进后台，它的 UI 就不在树里，
+于是误报「没投屏」。然后用 `dumpsys media_projection` 兜底——它一直返回 `null`，
+也不可用。
+
+**正确信号**是豆包的前台服务：
+
+```
+dumpsys activity services com.larus.nova | grep ScreenCaptureService
+  → isForeground=true
+```
+
+投屏中计数 3，退出后 0，**与哪个 App 占前台无关**。
+
+**错误二：我自己把直播杀了。** `ensure_share` 里写了
+
+```bash
+am force-stop com.opencode.multilensipcam   # 为了让豆包「占住相机」
+```
+
+结果直播 App 一死 API 就没了，看起来就像「被挤掉了」。
+已删掉这行。豆包开屏幕共享并不需要独占相机。
+
+### 分屏是多余的
+
+我试过 `--windowingMode 3` 想让两个 App 都可见，结果 `23B HTTP 503`，
+投屏也断了。不需要分屏——豆包在后台就行。
+
+## 开机自启：用 Magisk service.d
 
 ## 开机自启：用 Magisk service.d
 
@@ -124,6 +166,6 @@ MIUI 只允许**可见前台**的 App 用相机。实测对照：
 
 ## 板子还要不要
 
-不要了。除了「投屏 + 直播同时进行」这一件事做不到（系统限制），
-其余全部在手机内闭环。板子侧原有的 `keepcast` / `lenscast` / `smartcast`
+不要了。投屏 + 直播**同时**跑这一点已经验证通过，全部在手机内闭环。
+板子侧原有的 `keepcast` / `lenscast` / `smartcast`
 现在反而可能与手机上的守护抢前台，建议保持暂停（`state/allow.json` 里已置 false）。
