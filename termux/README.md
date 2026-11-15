@@ -1,69 +1,129 @@
-# termux/ —— 手机本地的启动脚本
+# termux/ —— 手机独立运行，不需要板子
 
-在没有 Termux:Boot 的情况下，用手机自己的 Termux 把启动流程固定下来。
+**结论：这台手机的 Termux 能拿到 root，所以整套流程可以完全在手机内跑完，RK3588S 可以拔掉。**
 
-## 为什么会有这一套
+## 关键发现：Termux 有 root
 
-原来全靠板子远程 `adb shell` 操作手机，三个结构性弱点：
+```
+$ run-as com.termux sh -c 'su -c id'
+uid=0(root) gid=0(root) groups=0(root) context=u:r:magisk:s0
+```
 
-1. **延迟**：板子每 20 秒轮询一次，插上手机后要等一轮才开始。
-2. **时序脆**：屏幕 Dozing 时 `dumpsys activity` 返回空，前台判断会误判。
-3. **单点**：板子上的守护挂了，手机就没人管了。
+之前反复卡住的三件事，一次全通：
 
-把逻辑搬进手机后，`input`/`am`/`dumpsys` 都走本机回环，不受 USB 隧道和轮询间隔影响。
+| 操作 | 无 root 时 | 有 root 后 |
+|---|---|---|
+| `input keyevent` | `SecurityException: needs INJECT_EVENTS` | ✅ `rc=0` |
+| `am start` | `package=com.android.shell does not belong to uid=10243` | ✅ 正常 |
+| `setprop persist.adb.tcp.port` | `rc=1` | ✅ 写入成功，重启仍有效 |
 
-## Termux 的两个权限陷阱（实测）
+所以**不需要回环 adb，不需要板子执行 `adb tcpip`**，也就没有了「重启后回环失效」的问题。
 
-| 尝试 | 结果 |
-|---|---|
-| Termux 里直接 `am start` | ❌ `SecurityException: package=com.android.shell does not belong to uid=10243` |
-| Termux 里 `input keyevent` | ❌ `SecurityException: Injecting input events requires INJECT_EVENTS` |
-| Termux 里 `monkey -p ...` | ❌ `Error: Unable to connect to window manager` |
-| Termux 里 `adb connect 127.0.0.1:5555` | ✅ 拿到 **shell 身份**，上面全部可用 |
+## 直播为什么连 adb 都不需要
 
-所以：**一切都通过本机回环 adb 执行，绝不用 Termux 自己的 uid 调系统命令。**
+直播 App 的 HTTP API 就在 `127.0.0.1:41737`，Termux 直接 `curl` 即可：
+
+```
+$ curl -s http://127.0.0.1:41737/api/state
+{"streaming":true,"selectedResolution":"3840x2160","qualityValue":100,...}
+
+$ curl -s -X POST "http://127.0.0.1:41737/api/control?resolution=3840x2160&quality=100&zoom=1.53"
+{"ok":true}
+```
+
+参数控制、开流、抓帧全走这个 API，**一次 adb 都不用调**。
 
 ## 文件
 
-- `nova_agent.sh` —— 主脚本。`watch`（守护）/ `lens`（只保直播）/ `share` / `once` / `status` / `stop`
-- `find_ui.py` —— 在 uiautomator XML 里按**完全相等**找控件并返回可点坐标
-- `boot.sh` —— 外部统一入口：连回环 adb + 起守护（带单实例锁）
+- `nova.sh` —— 主脚本，手机独立版（当前用这个）
+- `nova_agent.sh` —— 旧版，依赖回环 adb，留作对照
+- `find_ui.py` —— 旧版 UI 查找，逻辑已并入 `nova.sh`
+- `boot.sh` —— 旧版入口（回环路线）
 
-## find_ui.py 为什么必须存在
+用法：
 
-豆包投屏后，屏幕上有：
+```sh
+./nova.sh once      # 投屏 + 直播各一次
+./nova.sh lens      # 只保直播（参数 + 出图）
+./nova.sh share     # 只做投屏
+./nova.sh watch     # 常驻守护，20s 一轮
+./nova.sh status    # 看状态
+./nova.sh install   # 装开机自启
+./nova.sh stop      # 停守护
+```
+
+## 三个必须踩过的坑
+
+### 1. 豆包没有 `.MainActivity`
 
 ```
-text="正在共享屏幕"              ← 标题，bounds [375,767][705,841]
-content-desc="共享屏幕"          ← 真按钮，bounds [308,2012][518,2222]
+$ am start -n com.larus.nova/.MainActivity
+Error: Activity class {com.larus.nova/com.larus.nova.MainActivity} does not exist.
 ```
 
-用 `grep -F "共享屏幕"` 做子串匹配，**先命中的是标题**（y≈804），点下去毫无反应，
-日志却写「已点共享屏幕」——比直接报错更难查。`find_ui.py` 只认完全相等，
-并且优先选 `clickable=true` 的节点。
+真正的入口是启动别名：
 
-## ⚠ 硬限制：投屏和直播抢前台，互斥
+```
+$ cmd package resolve-activity --brief com.larus.nova
+com.larus.nova/com.larus.home.impl.alias.AliasActivity1
+```
+
+### 2. 投屏状态不能查 `dumpsys`
+
+- `dumpsys activity` 里没有「正在共享屏幕」这串字
+- `dumpsys media_projection` 返回 `null` 也不代表没开（实测过）
+
+唯一可靠来源是 UI 树：dump 一次，看有没有「退出屏幕共享」按钮。
+
+### 3. `find_ui` 必须完全相等匹配
+
+投屏后的屏幕上有：
+
+```
+text="正在共享屏幕"       ← 标题，bounds [375,767][705,841]     y≈804
+content-desc="共享屏幕"   ← 真按钮，bounds [308,2012][518,2222]  y≈2117
+```
+
+用 `grep -F "共享屏幕"` 做子串匹配会**先命中标题**，点下去毫无反应，
+日志却写「已点共享屏幕」——比直接报错更难查。必须完全相等，且优先 `clickable=true`。
+
+## ⚠ 硬限制：投屏和直播互斥，无法绕过
 
 MIUI 只允许**可见前台**的 App 用相机。实测对照：
 
 | 前台 | `/snapshot.jpg` |
 |---|---|
-| 豆包通话页 | `0B / HTTP 000`（连不上） |
-| 直播 App | `23B / HTTP 503`（连上但相机没工作） |
-| 直播 App（干净重启后） | `1181976B / HTTP 200` ✅ |
+| 豆包通话页 | `0B / HTTP 000` |
+| 直播 App（在后台） | `23B / HTTP 503` |
+| 直播 App（干净前台） | `560671B / HTTP 200` ✅ |
 
-而且豆包通话页是内部 Activity，`am start` 拉不回来（必须走 App 自己的流程）。
-一旦被挤掉，投屏就断了，只能重新点。
+**试过分屏（`--windowingMode 3`）：结果是 `23B / HTTP 503`，投屏也断了。**
+两个 App 同时可见也救不了，这是相机独占，不是窗口问题。
 
-**结论：不要试图并发。** 所以 `watch` 默认走 `lens` 模式：
-检测到投屏在开就主动让路，不抢前台；投屏关了才接管直播。
+所以 `watch` 默认走 `lens` 模式：检测到投屏在开就主动让路，不抢前台。
 
-## 开机自启（未解决的部分）
+⚠ 要提一点：实测中一度出现过 `owner=com.larus.nova` 且 `streaming=True`、
+帧约 1.51MB 的并存状态，之后没能复现。默认按互斥处理，因为那是可复现的常态。
 
-- Termux:Boot **装不上**：F-Droid 版签名与已装 Termux 冲突
-  （`INSTALL_FAILED_SHARED_USER_INCOMPATIBLE`）。
-- `persist.adb.tcp.port` **写不了**：需要 root。
-- 手机重启后 adbd 会回到 USB 模式，`127.0.0.1:5555` 随之失效。
-  需要板子执行一次 `adb tcpip 5555` 才能恢复回环。
+## 开机自启：用 Magisk service.d
 
-现状：`boot.sh` 可由 Tasker 开机任务或板子调用；回环断了会记录日志并继续重试。
+`Termux:Boot` 装不上（F-Droid 版签名与已装 Termux 冲突，
+`INSTALL_FAILED_SHARED_USER_INCOMPATIBLE`）。而且 Termux 本身是普通 app，
+会被 MIUI 的 SmartPower 杀。
+
+所以用 Magisk 的 `/data/adb/service.d/`：
+
+- 里面跑的是 **root shell**，不是 app 进程，SmartPower 碰不到
+- 开机自动执行所有 `.sh`，不依赖 Termux app 是否被拉起
+- 已有的 `/data/adb/service.d/taskerd.sh`（Tasker 存活守护）用的是同一招
+
+`nova.sh install` 会写 `/data/adb/service.d/nova.sh`，它负责：
+1. 等 `sys.boot_completed=1`（不等的话 `am start` 会失败）
+2. 每 60s 检查 `nova.sh watch` 是否活着，不在就重拉
+3. `setprop persist.adb.tcp.port 5555`（重启后仍有效，虽然现在不需要了）
+
+## 板子还要不要
+
+不要了。除了「投屏 + 直播同时进行」这一件事做不到（系统限制），
+其余全部在手机内闭环。板子侧原有的 `keepcast` / `lenscast` / `smartcast`
+现在反而可能与手机上的守护抢前台，建议保持暂停（`state/allow.json` 里已置 false）。
