@@ -84,7 +84,10 @@ PORT = int(os.environ.get("LENS_PORT", "41737"))
 BASE = "http://127.0.0.1:%d" % PORT
 
 CHECK_EVERY = float(os.environ.get("LENS_INTERVAL", "30"))
-BACKOFF_MAX = 600.0
+# 连续失败的最长退避。原来 600s（10 分钟）——失败 5 次后守护会静默躺 10 分钟，
+# 用户在网页上看就是"怎么一直没反应"。降到 120s，配合下面的可打断睡眠：
+# 手机一插回来 / 网页一改状态就立刻继续，不用等退避走完。
+BACKOFF_MAX = 120.0
 
 # 用户指定的目标参数。改这里就是改自动化目标。
 WANT = {
@@ -227,6 +230,27 @@ def start_app(serial):
         return True
     except Exception:
         return False
+
+
+def sleep_interruptible(seconds, serial=None):
+    """睡 seconds 秒，但「值得马上重试」的事件一到就提前醒。
+
+    退避期间干等会导致：手机重新插上了、网页上把开关拨开了，守护却还在
+    睡（原来最长 10 分钟），用户看到的就是「改了没反应」。
+    这里每 3 秒瞥一眼，事件一到立刻返回。
+    """
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        time.sleep(min(3.0, max(0.0, deadline - time.time())))
+        try:
+            if not gate.is_allowed("lenscast") or os.path.exists(PAUSE):
+                return "开关变化"
+            plugged, _ = keepcast.usb_present()
+            if plugged:
+                return "USB 已插入"
+        except Exception:
+            pass
+    return "到时"
 
 
 def foreground(serial):
@@ -541,7 +565,7 @@ def main():
             last_ok = None
             # 退避：连续失败时别每 30 秒锤一次，4K 编码很吃资源
             wait = min(CHECK_EVERY * (2 ** min(fails - 1, 4)), BACKOFF_MAX)
-            time.sleep(wait)
+            sleep_interruptible(wait, serial)
         except Exception as e:
             log("守护出错（继续）：%s" % str(e)[:100])
             time.sleep(CHECK_EVERY)
