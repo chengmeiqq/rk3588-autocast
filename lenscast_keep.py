@@ -153,10 +153,52 @@ def get_state():
         return None
 
 
+CTL_ERR = ""   # 上一次 ctl() 失败的原因，供日志区分"无响应"和"被拒"
+
+
 def ctl(**params):
+    """发一条控制指令。返回 bool，失败原因写进 CTL_ERR。
+
+    必须区分两种失败，否则排查会被带偏：
+      - HTTP 000 / 超时 = App 的 HTTP 线程卡死，此时把 App 弄到前台
+        再重来才有用；写"指令被拒"是假的，接口根本没响应。
+      - {"ok":false}    = 真的被拒，参数或状态不允许。
+    App 在后台申请摄像头会阻塞在 connectHelper，就是第一种。
+    """
+    global CTL_ERR
     q = "&".join("%s=%s" % (k, urllib.parse.quote(str(v))) for k, v in params.items())
     code, body = http("/api/control?" + q, timeout=15)
-    return code == 200 and b'"ok":true' in body.replace(b" ", b"")
+    if code is None:
+        CTL_ERR = "无响应（HTTP 不通，App 可能卡在后台取相机）"
+        return False
+    if code != 200:
+        CTL_ERR = "HTTP %s" % code
+        return False
+    if b'"ok":true' in body.replace(b" ", b""):
+        CTL_ERR = ""
+        return True
+    CTL_ERR = "被拒绝：%s" % body[:120].decode("utf-8", "replace")
+    return False
+
+
+def ensure_foreground(serial):
+    """确保直播 App 在可见前台。
+
+    MIUI 的 appops 是 CAMERA: foreground —— App 退到后台就一律拒绝开相机，
+    而且拒绝的方式是让 HTTP 线程卡在 connectHelper（不是返回错误）。
+    所以开流之前必须先把 App 顶到前台，否则 ctl(streaming) 必然超时。
+    实测：keepcast 投屏成功后按 HOME 回桌面，紧接着 lenscast 开流就失败。
+    """
+    fg = foreground(serial)
+    if PKG in fg:
+        return True
+    log("开流前 App 不在前台（%s），先顶到前台" % (fg or "未知"))
+    bring_to_front(serial)
+    for _ in range(4):
+        time.sleep(1.5)
+        if PKG in foreground(serial):
+            return True
+    return False
 
 
 def ensure_forward(serial):
@@ -365,11 +407,18 @@ def bring_up(serial):
                 return False, "HTTP 不通且进程已死 %s" % why
             return False, "HTTP 不通（App 在初始化或端口未就绪）"
 
+    # 先确保在可见前台，再做任何 ctl（apply_params 里也有 ctl）。
+    # MIUI 的 appops 是 CAMERA: foreground，App 在后台时不仅开不了相机，
+    # 连 /api/control 都会卡在 connectHelper 超时。keepcast 投屏成功后
+    # 按 HOME 回桌面，紧接着这里就会踩到——实测 11:49 就是这样失败的。
+    if not ensure_foreground(serial):
+        return False, "无法把 App 切到前台，本轮不动手"
+
     st = apply_params(st) or get_state() or {}
 
     if not (st or {}).get("streaming"):
         if not ctl(streaming="true"):
-            return False, "开流指令被拒"
+            return False, "开流指令失败：%s" % (CTL_ERR or "未知")
         time.sleep(7)
 
     st = get_state() or {}
