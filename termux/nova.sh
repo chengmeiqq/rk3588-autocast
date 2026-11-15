@@ -46,6 +46,21 @@ else
   R() { su -c "$*" 2>&1 | tr -d '\r'; }
 fi
 
+# 静默版：stderr 直接丢掉，不合并进 stdout。
+#
+# 为什么需要这个：R() 是 `su -c "$*" 2>&1`，su 自己往 stderr 吐的告警
+# （例如 sh 的报错）会被并进 stdout。于是「扫描进程」这种拿 stdout 当
+# 数据的调用就收到了垃圾行，外面再写 2>/dev/null 也拦不住（重定向只作用于
+# 整条管道，不是 R 内部的合并）。
+# 实测后果：2026-11-15 14:37 nova.sh status 打出 `守护: 跑着 pid=/system/bin/sh:`。
+RS() {
+  if [ "$(id -u 2>/dev/null)" = "0" ]; then
+    eval "$*" 2>/dev/null
+  else
+    su -c "$*" 2>/dev/null
+  fi
+}
+
 API=http://127.0.0.1:41737
 PKG=com.opencode.multilensipcam
 ACT=$PKG/.MainActivity
@@ -477,8 +492,22 @@ status() {
   else
     echo "直播:       API 不通"
   fi
-  if [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; then
-    echo "守护:       跑着 pid=$(cat "$PIDF")"
+  # 守护存活判断必须扫真实进程，不能只看 $PIDF。
+  #
+  # 坑：PIDF 是守护自己写的（echo $$ > $PIDF），但由 service.d 起来的
+  # 守护是 root，它的 $HOME 不是 Termux 的 $HOME —— Termux 用户去读
+  # $HOME/.nova/watch.pid 读的是自己的目录，里面没有 root 守护的 pid。
+  # 实测后果：2026-11-15 14:33 进程扫描明明看到 WATCH 16252 活着，
+  # nova.sh status 却报「守护: 没跑」，又是一次自己骗自己。
+  local wp; wp=$(find_watch_pids 2>/dev/null)
+  local nids; nids=$(echo "$wp" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "${nids:-0}" -gt 0 ] 2>/dev/null; then
+    local list; list=$(echo "$wp" | awk '{printf "%s ", $1}')
+    if [ "$nids" -gt 1 ]; then
+      echo "守护:       跑着 ${nids} 个（异常，应只有 1 个）pid=${list}"
+    else
+      echo "守护:       跑着 pid=${list}"
+    fi
   else
     echo "守护:       没跑"
   fi
@@ -626,11 +655,36 @@ find_watch_pids() {
   #    「已有守护在跑（3276 3277）」而实际没有任何守护。
   #
   # 所以按进程链排除：从左往右读 ppid，凡是在这条链上的 pid 全跳过。
+  #
+  # C) 再排除「父进程也是 nova.sh watch」的候选。
+  #    坑：bash 执行 $(...) 会 fork 子进程，子进程在 exec 之前
+  #    /proc/<pid>/cmdline 完全继承父进程的 argv，就是
+  #      bash ./nova.sh watch
+  #    正好三个参数，A 和 B 都拦不住。守护每 20s 跑一堆 $(...)，
+  #    于是扫描必然看到一群“假守护”。
+  #    实测后果：2026-11-15 22:40 日志报「已有守护在跑（16252 2444 2447）」，
+  #    后两个是瞬时子进程。
+  #    真守护的父进程是 service.d 的 sh 或终端，不会是 nova.sh；
+  #    所以父 cmdline 是三段式 nova.sh watch 的，一定是 fork 未 exec 的影子。
+  #
+  # 附：取 ppid 不能用 awk '{print $4}' —— /proc/pid/stat 的 comm 字段
+  # 带括号且可含空格（如 (sh -c)），字段位置会错。先剥掉括号那段。
   # shellcheck disable=SC2016
-  R 'chain=" $$ "
+  RS 'ppid_of() {
+         s=$(cat /proc/$1/stat 2>/dev/null) || return 1
+         s=${s##*)}          # 去掉 "pid (comm)" 前缀
+         set -- $s
+         echo "${1:-}"
+       }
+       is_nova() {
+         [ -r "/proc/$1/cmdline" ] || return 1
+         set -- $( { tr "\0" " " < "/proc/$1/cmdline"; } 2>/dev/null )
+         [ $# -eq 3 ] && [ "$2" = "./nova.sh" ] && [ "$3" = "watch" ]
+       }
+       chain=" $$ "
        p=$$
        while :; do
-         n=$(awk "{print \$4}" /proc/$p/stat 2>/dev/null)
+         n=$(ppid_of "$p")
          [ -n "$n" ] || break
          [ "$n" = "0" ] && break
          [ "$n" = "1" ] && break
@@ -642,13 +696,13 @@ find_watch_pids() {
          [ -r "$d/cmdline" ] || continue
          pid=${d#/proc/}
          case "$chain" in *" $pid "*) continue ;; esac
-         c=$( { tr "\0" " " < "$d/cmdline"; } 2>/dev/null ) || continue
-         set -- $c
-         [ $# -eq 3 ] || continue
-         [ "$2" = "./nova.sh" ] || continue
-         [ "$3" = "watch" ] || continue
-         echo "$pid $1"
-       done )' 2>/dev/null | tr -d '\r' | sort -u
+         is_nova "$pid" || continue
+         pp=$(ppid_of "$pid")
+         [ -n "$pp" ] && is_nova "$pp" && continue
+         echo "$pid $(set -- $( { tr "\0" " " < "$d/cmdline"; } 2>/dev/null ); echo "$1")"
+       done ' | tr -d '\r' | awk '$1 ~ /^[0-9]+$/ {print $1, $2}' | sort -u
+  #    ^^ 用 RS（stderr 不合并）；后面的 awk 再按「第一列必须是纯数字」过一道——
+  #       双重保险，就算 su / sh 往 stdout 说了什么，也不会被当成 pid。
 }
 
 acquire_lock() {
