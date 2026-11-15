@@ -294,3 +294,103 @@ loop 最多 12 次:
 | 参数 | 读回 `/api/state`，比对分辨率/质量/变焦三项 |
 | 出图 | `snapshot.jpg` 字节数 > 10KB 且 HTTP 200 |
 | 并存 | 投屏信号 + 前台 + 出图三者同时成立 |
+
+## 断电上电（直供电场景）实测
+
+用户场景：手机改了直供电，**断电就关机，插电就开机**。
+要求每次上电都自动进到「豆包后台投屏 + 直播前台」的状态，无人干预。
+
+这跟普通重启不一样，必须额外处理四件事：
+
+### 1. 等网络就绪（否则必失败）
+
+断电后 WiFi 要几十秒才关联上，而豆包打电话需要联网。
+原来 `ensure_network` 只关飞行模式，**不等到真能出网**就往下走。
+
+现在加了 `wait_online`：
+
+```sh
+# 先等 wlan0 拿到 IP（最多 60s）
+# 再用 MIUI 的 204 端点确认真能出网（最多 60s）
+curl -s -m 5 -o /dev/null -w '%{http_code}' \
+  http://connect.rom.miui.com/generate_204   # 要 204
+```
+
+日志里会看到 `网络就绪（192.168.1.119）`。
+
+### 2. boot_completed=1 不等于能操作
+
+MIUI 在 `sys.boot_completed=1` 之后还要几十秒初始化包管理器、
+通知、输入服务。太早 `am start` 会失败。
+service.d 里加了固定延迟：
+
+```sh
+wait_boot || log "等 boot_completed 超时，继续"
+log "系统就绪"
+sleep 15                      # 给 MIUI 收尾
+log "延迟 15s 后开始"
+```
+
+### 3. set -u 下变量必须先初始化
+
+单实例锁里写了 `local d pid found`，循环没命中时 `found` 从未赋值。
+`set -u` 下一引用就 `found: unbound variable` 直接退出。
+**守护反复崩溃、service.d 每 60s 重拉**，看起来像「起不来」。
+
+修法：`local d pid cmd found=""`。
+
+### 4. 扫 /proc 要先判可读
+
+`for d in /proc/[0-9]*` 循环里进程随时会退出，读 cmdline 会刷：
+
+```
+./nova.sh: line 531: /proc/12731/cmdline: No such file or directory
+```
+
+修法：`[ -r "$d/cmdline" ] || continue`，并把读取整体丢 stderr。
+
+### 实测时间线（21:48:36 上电 → 21:49:49 就绪，73 秒）
+
+```
+21:48:36  service.d 启动 pid=2269
+21:48:50  系统就绪（boot_completed=1）
+21:49:05  延迟 15s 后开始
+21:49:07  守护不在，拉起
+21:49:15  守护启动
+21:49:15  网络就绪（192.168.1.119）   ← wait_online 生效
+21:49:15  拉起豆包
+21:49:25  点「打电话」
+21:49:27  通话页已起
+21:49:32  点「共享屏幕」
+21:49:35  点「立即开始」
+21:49:38  投屏已开
+21:49:38  直播拉前台
+21:49:49  并存 OK：投屏在，直播 480188B
+```
+
+上电后 124 秒的独立复核（不靠脚本自报）：
+
+```
+uptime:  124s
+前台:    com.opencode.multilensipcam/.MainActivity
+投屏:    ScreenCaptureService 3 次
+相机:    Client Package Name: com.opencode.multilensipcam
+帧:      1299918B / 1267212B / 1269463B   全 HTTP 200
+参数:    streaming=True 3840x2160 q100 zoom1.53
+网络:    inet 192.168.1.119
+屏幕:    Awake
+```
+
+帧涨到 1.27MB（之前 480KB）是因为重启后画面内容更复杂，
+不是分辨率变化——参数仍是 3840x2160。
+
+### 已确认的配套设置
+
+| 设置 | 值 | 为什么重要 |
+|---|---|---|
+| `stay_on_while_plugged_in` | `7` | 插着电就不息屏，直供电必须 |
+| `lock_settings get-disabled` | `true` | 无锁屏，开机不会卡在密码界面 |
+| `screen_off_timeout` | `600000` | 10 分钟，配合上一项 |
+| `wifi_on` | `1` | 开机自动开 WiFi |
+| `wifi_scan_always_enabled` | `1` | 息屏也扫，加快关联 |
+| `ro.crypto.state` | `encrypted`（file） | 用户锁屏已禁用，CE 存储可用 |

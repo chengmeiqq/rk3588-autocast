@@ -202,6 +202,31 @@ ensure_network() {
   fi
 }
 
+# 断电重启后 WiFi 要几十秒才能关联上。豆包打电话要联网，
+# 等不到就拉起来会直接失败，所以必须真等到能出网。
+wait_online() {
+  local i ip
+  # 先看有没有 IP
+  for i in $(seq 1 30); do
+    ip=$(R "ip -4 addr show wlan0 2>/dev/null" | grep -o 'inet [0-9.]\+' | head -1)
+    [ -n "$ip" ] && break
+    [ "$i" = "1" ] && say "等 WiFi 拿 IP"
+    sleep 2
+  done
+  [ -z "$ip" ] && { say "WiFi 没拿到 IP"; return 1; }
+
+  # 再看到底能不能出网（MIUI 的 204 端点）
+  for i in $(seq 1 30); do
+    local cd
+    cd=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://connect.rom.miui.com/generate_204 2>/dev/null)
+    [ "$cd" = "204" ] && { say "网络就绪（${ip#inet }）"; return 0; }
+    [ "$i" = "1" ] && say "等网络出网"
+    sleep 2
+  done
+  say "有 IP 但出不了网"
+  return 1
+}
+
 ensure_screen_on() {
   local s
   s=$(R "dumpsys power | grep -m1 'mWakefulness='")
@@ -221,6 +246,8 @@ ensure_share() {
   fi
   ensure_network
   ensure_screen_on
+  # 豆包打电话需要联网；冷启动时 WiFi 可能还没起来
+  wait_online || say "网络未就绪，先试一次"
 
   # 不要让直播 App force-stop：它一死 API 就没了，而且重启后相机要重新初始化。
   # 豆包的投屏流程不需要独占相机（实测流着的时候豆包在前台也不报错），
@@ -434,13 +461,19 @@ wait_boot() {
 
 # 单实例：已有 nova watch 在跑就退出
 for d in /proc/[0-9]*; do
-  c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  [ -r "$d/cmdline" ] || continue
+  c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
   case "$c" in *nova.sh*watch*) log "已有实例（${d#/proc/}），退出"; exit 0 ;; esac
 done
 
 log "启动 pid=$$"
 wait_boot || log "等 boot_completed 超时，继续"
 log "系统就绪"
+
+# boot_completed=1 不代表能操作：MIUI 还要几十秒初始化包管理器/
+# 通知/输入服务。太早 am start 会失败。
+sleep 15
+log "延迟 15s 后开始"
 
 # Termux 的 bash 是唯一能跑 nova.sh 的（用了 bash 语法）
 TB=/data/data/com.termux/files/usr/bin/bash
@@ -450,7 +483,8 @@ until [ -x "$TB" ]; do log "等 $TB"; sleep 5; done
 while true; do
   alive=0
   for d in /proc/[0-9]*; do
-    c=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+    [ -r "$d/cmdline" ] || continue
+    c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
     case "$c" in *nova.sh*watch*) alive=1; break ;; esac
   done
   if [ "$alive" = "0" ]; then
@@ -494,12 +528,30 @@ EOF
 }
 
 acquire_lock() {
-  if [ -f "$PIDF" ]; then
-    local old; old=$(cat "$PIDF" 2>/dev/null)
-    if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then
-      say "已在跑 pid=$old"
-      return 1
-    fi
+  # 不只靠 pid 文件：stop 删了文件，或重启后文件残留，都会误判。
+  # 直接扫 /proc 找真在跑的 nova.sh watch，最可靠。
+  #
+  # 注意两个坑：
+  #  1) 脚本开了 set -u，found 必须先初始化，否则空循环后引用直接崩溃。
+  #  2) 扫 /proc 势不可避免碰到刚退出的进程，读 cmdline 会报
+  #     "No such file or directory"。先 -r 判可读，且重定向整体丢 stderr。
+  local d pid cmd found=""
+  for d in /proc/[0-9]*; do
+    pid=${d#/proc/}
+    [ "$pid" = "$$" ] && continue
+    [ -r "$d/cmdline" ] || continue
+    cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
+    case "$cmd" in
+      *nova.sh*watch*)
+        found=$pid
+        break
+        ;;
+    esac
+  done
+  if [ -n "$found" ]; then
+    say "已有守护在跑 pid=$found，不重复起"
+    echo "$found" > "$PIDF" 2>/dev/null
+    return 1
   fi
   echo $$ > "$PIDF"
   return 0
