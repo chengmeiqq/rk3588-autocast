@@ -15,7 +15,7 @@
 #   ./nova.sh once     投屏 + 直播一次（回前台就停）
 #   ./nova.sh lens     只保证直播（参数 + 出图）
 #   ./nova.sh share    只做投屏
-#   ./nova.sh watch    常驻守护，每 20s 巡检一次
+#   ./nova.sh watch    常驻守护，每 20s 巡检一次（flock 单实例）
 #   ./nova.sh status   看状态
 #   ./nova.sh stop     停守护
 #   ./nova.sh install  装开机自启（写 .termux/boot + termux-services）
@@ -28,6 +28,11 @@ mkdir -p "$TMPDIR" "$HOME/.nova"
 
 LOG=$HOME/.nova/nova.log
 PIDF=$HOME/.nova/watch.pid
+# 锁不能放 $HOME/.nova：service.d 以 root 跑，会在 Termux 家目录里
+# 造出 root 属主的目录，之后 Termux 用户就写不进去了。
+# /data/local/tmp 是 root 和 app 都能到的地方。
+LOCKD=$HOME/.nova/watch.lock.d
+LOCKF=$HOME/.nova/watch.lock
 say() { echo "$(date '+%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
 
 # 所有系统操作都过 root。两种运行方式都支持：
@@ -65,50 +70,102 @@ sys.exit(0 if ok else 1)
 '
 }
 
+# 只读 /api/state 一次，一次性回答所有问题。
+# 关键优化：巡检周期只跑这个，不再每 20 秒下载 500KB 的 4K 帧。
+# 输出一行 JSON 给调用方解析。
+lens_probe() {
+  curl -s -m 8 "$API/api/state" 2>/dev/null | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception:
+    print("dead 0 0 0 0"); sys.exit(0)
+res = d.get("selectedResolution")
+q   = d.get("qualityValue")
+z   = d.get("zoomValue") or 0
+st  = bool(d.get("streaming"))
+params_ok = (res == "3840x2160" and q == 100 and abs(z - 1.53) < 0.02)
+print("%s %s %s %s %s" % (
+    "live" if st else "idle",
+    1 if params_ok else 0,
+    res or "-", q or 0, z))
+' 2>/dev/null || echo "dead 0 0 0 0"
+}
+
+# 帧存活检查：只取前 2KB（Range），确认是 JPEG + HTTP 200。
+# 不下载整个 4K 帧——巡检每 20 秒一次，全下等于每 20 秒吃掉 500KB。
+# 出图存活检查：用 HEAD 而不是 GET。
+#
+# 这个服务端不支持 Range（实测 -r 0-2047 仍回整个 498KB 帧），
+# 而快照是 302 跳到 /snapshots/<ts>.jpg 的。所以：
+#   HEAD + -L  → 302 跟到最终图，只拿响应头，下 0 字节，约 40ms
+# 巡检每 20 秒一次，用 GET 等于每 20 秒吃掉 500KB。
+# 真正的「有没有画面」由 api/state 的 streaming 判断，
+# 这里只确认端点还活着、图像能拼出来（HTTP 200）。
+frame_alive() {
+  local cd
+  cd=$(curl -sIL -m 8 -o /dev/null -w '%{http_code}' \
+       "$API/snapshot.jpg" 2>/dev/null)
+  [ "${cd:-000}" = "200" ]
+}
+
 ensure_lens() {
-  local st
-  st=$(api_state)
-  if [ -z "$st" ]; then
+  local p st params_ok res q z
+  p=$(lens_probe)
+  set -- $p
+  st=${1:-dead}; params_ok=${2:-0}; res=${3:--}; q=${4:-0}; z=${5:-0}
+
+  if [ "$st" = "dead" ]; then
     say "直播 API 不通，拉起 App"
     R "am start -n $ACT" >/dev/null
     sleep 6
-    st=$(api_state)
-    [ -z "$st" ] && { say "API 还是不通"; return 1; }
+    p=$(lens_probe); set -- $p
+    st=${1:-dead}; params_ok=${2:-0}; res=${3:--}; q=${4:-0}; z=${5:-0}
+    [ "$st" = "dead" ] && { say "API 仍不通"; return 1; }
   fi
 
   # App 在不在前台？MIUI 只给可见前台 App 相机
   local top
-  top=$(R "dumpsys activity activities | grep -m1 topResumedActivity" | grep -o "$PKG/[^ }]*")
-  if [ -z "$top" ]; then
-    say "直播 App 不在前台，拉起"
-    R "input keyevent KEYCODE_WAKEUP" >/dev/null
-    R "am start -n $ACT" >/dev/null
-    sleep 6
-  fi
+  top=$(top_act)
+  case "$top" in
+    *"$PKG"*) ;;
+    *)
+      say "直播 App 不在前台，拉起"
+      R "input keyevent KEYCODE_WAKEUP" >/dev/null
+      R "am start -n $ACT" >/dev/null
+      sleep 6
+      ;;
+  esac
 
-  # 参数
-  if lens_params_ok; then
-    say "参数已对（3840x2160 q100 zoom1.53）"
+  # 参数：已经对就不动
+  if [ "$params_ok" = "1" ]; then
+    :   # 静默，不刷日志
   else
-    say "设参数"
-    R "true" >/dev/null
-    curl -s -m 10 -X POST "$API/api/control?resolution=3840x2160&quality=100&zoom=1.53" >/dev/null
+    say "设参数（当前 ${res} q${q} zoom${z}）"
+    curl -s -m 10 -X POST \
+      "$API/api/control?resolution=3840x2160&quality=100&zoom=1.53" >/dev/null
     sleep 2
-    lens_params_ok && say "参数已设好" || say "参数可能没生效"
+    p=$(lens_probe); set -- $p
+    params_ok=${2:-0}; res=${3:--}; q=${4:-0}; z=${5:-0}
+    [ "$params_ok" = "1" ] && say "参数已设好" \
+      || say "参数可能没生效（${res} q${q} zoom${z}）"
   fi
 
-  # 开流
-  curl -s -m 10 -X POST "$API/api/control?streaming=true" >/dev/null
-  sleep 2
+  # 开流：已经在流就不重复 POST
+  if [ "$st" != "live" ]; then
+    say "开流"
+    curl -s -m 10 -X POST "$API/api/control?streaming=true" >/dev/null
+    sleep 2
+  fi
 
-  # 出图验证
-  local f
-  f=$(curl -sL -m 18 -o /dev/null -w '%{size_download} %{http_code}' "$API/snapshot.jpg")
-  local sz=${f%% *} cd=${f##* }
-  if [ "${cd:-000}" = "200" ] && [ "${sz:-0}" -gt 10000 ] 2>/dev/null; then
-    say "直播 OK ${sz}B HTTP $cd"
+  # 出图：只取前 2KB 验证，不下整帧
+  if frame_alive; then
+    [ "$st" = "live" ] || say "直播已开"
     return 0
   fi
+
+  # 这里才真的抓一整帧看大小，用于定位问题
+  local f
+  f=$(curl -sL -m 18 -o /dev/null -w '%{size_download} %{http_code}' "$API/snapshot.jpg")
   say "帧异常: ${f:-无响应}"
   return 1
 }
@@ -385,16 +442,15 @@ mode_both() {
   # 3) 直播参数 + 出图
   ensure_lens
   # 4) 确认两边同时成立
-  local ok_share=0 ok_lens=0 f sz cd
+  #    这里也用 HEAD 查帧，不下载 500KB（见 frame_alive 注释）
+  local ok_share=0 ok_lens=0
   sharing && ok_share=1
-  f=$(curl -sL -m 15 -o /dev/null -w '%{size_download} %{http_code}' "$API/snapshot.jpg")
-  sz=${f%% *}; cd=${f##* }
-  [ "${cd:-000}" = "200" ] && [ "${sz:-0}" -gt 10000 ] 2>/dev/null && ok_lens=1
+  frame_alive && ok_lens=1
   if [ "$ok_share" = "1" ] && [ "$ok_lens" = "1" ]; then
-    say "并存 OK：投屏在，直播 ${sz}B"
+    say "并存 OK：投屏在，直播在出图"
     return 0
   fi
-  say "状态：投屏=$ok_share 直播=$ok_lens (${f:-无响应})"
+  say "状态：投屏=$ok_share 直播=$ok_lens"
   return 1
 }
 
@@ -459,11 +515,21 @@ wait_boot() {
   return 1
 }
 
-# 单实例：已有 nova watch 在跑就退出
+# 单实例：已有 nova watch 在跑就退出。
+#
+# 这里不能用 *nova.sh*watch* 子串匹配 —— 本脚本运行时自己的 cmdline
+# 是 /data/adb/service.d/nova.sh，虽然不含 watch，但这个监控脚本曾经
+# 被同样的写法坑过（见下面巡检循环的注释）。统一用严格三段式匹配：
+#   参数正好 3 个，第 2 个是 ./nova.sh，第 3 个是 watch。
 for d in /proc/[0-9]*; do
   [ -r "$d/cmdline" ] || continue
   c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
-  case "$c" in *nova.sh*watch*) log "已有实例（${d#/proc/}），退出"; exit 0 ;; esac
+  set -- $c
+  [ $# -eq 3 ] || continue
+  [ "$2" = "./nova.sh" ] || continue
+  [ "$3" = "watch" ] || continue
+  log "已有实例（${d#/proc/}），退出"
+  exit 0
 done
 
 log "启动 pid=$$"
@@ -479,13 +545,22 @@ log "延迟 15s 后开始"
 TB=/data/data/com.termux/files/usr/bin/bash
 until [ -x "$TB" ]; do log "等 $TB"; sleep 5; done
 
-# 每 60s 确保守护活着（进程死了就重拉）
+# 每 20s 确保守护活着（进程死了就重拉）
+#
+# 匹配必须严格。这个监控脚本自己的 cmdline 里也含 "nova.sh" 和 "watch"，
+# 用 *nova.sh*watch* 子串匹配会匹配到自己 —— 于是永远认为「守护还在」，
+# 真死了也不重拉，开机后静静躺平。
 while true; do
   alive=0
   for d in /proc/[0-9]*; do
     [ -r "$d/cmdline" ] || continue
     c=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
-    case "$c" in *nova.sh*watch*) alive=1; break ;; esac
+    set -- $c
+    [ $# -eq 3 ] || continue
+    [ "$2" = "./nova.sh" ] || continue
+    [ "$3" = "watch" ] || continue
+    alive=1
+    break
   done
   if [ "$alive" = "0" ]; then
     log "守护不在，拉起"
@@ -493,7 +568,7 @@ while true; do
       $TB ./nova.sh watch >>"$LOG" 2>&1 &
     sleep 5
   fi
-  sleep 60
+  sleep 20
 done
 SVC
 
@@ -527,33 +602,106 @@ EOF
   say "完成。下次开机自动跑。现在想立即生效：nova.sh watch &"
 }
 
-acquire_lock() {
-  # 不只靠 pid 文件：stop 删了文件，或重启后文件残留，都会误判。
-  # 直接扫 /proc 找真在跑的 nova.sh watch，最可靠。
+# 找正在跑的 nova.sh watch（任意 uid）。返回 pid，没有则空。
+#
+# 为什么必须走 root 扫：service.d 起的守护是 root，Termux 自己起的
+# 是 u0_a243。同一个 Termux 用户扫不到 root 进程，于是会出现
+# 「root 守护 + Termux 守护」两个同时在跑，每 20 秒互相抢投屏和 API。
+# 这不是理论风险，2026-11-15 实测把直播 API 打到端口都不监听了。
+find_watch_pids() {
+  # 找正在跑的 nova.sh watch。返回 "pid 可执行文件路径"，一行一个。
   #
-  # 注意两个坑：
-  #  1) 脚本开了 set -u，found 必须先初始化，否则空循环后引用直接崩溃。
-  #  2) 扫 /proc 势不可避免碰到刚退出的进程，读 cmdline 会报
-  #     "No such file or directory"。先 -r 判可读，且重定向整体丢 stderr。
-  local d pid cmd found=""
-  for d in /proc/[0-9]*; do
-    pid=${d#/proc/}
+  # 两个必须同时满足的过滤条件：
+  #
+  # A) 参数严格是 3 个，且第 2、3 个是 ./nova.sh watch。
+  #    不能用 *nova.sh*watch* 子串匹配 —— 扫描命令自己的 cmdline 里
+  #    就带这两个词，会匹配到自己，于是永远「已有守护在跑」。
+  #
+  # B) 排除自己这条进程链（$$ 及其祖宗）。
+  #    坑：这个函数是 R() 调用的，R 在非 root 下走 su -c，
+  #    而 su 会 fork 一个 sh -c，那条命令行正好是
+  #      sh -c for d in /proc/... [ "$2" = "./nova.sh" ] [ "$3" = "watch" ] ...
+  #    展开后参数形态和真的守护一模一样，条件 A 拦不住它。
+  #    实测后果：2026-11-15 所有启动都被自己挡住，日志里刷
+  #    「已有守护在跑（3276 3277）」而实际没有任何守护。
+  #
+  # 所以按进程链排除：从左往右读 ppid，凡是在这条链上的 pid 全跳过。
+  # shellcheck disable=SC2016
+  R 'chain=" $$ "
+       p=$$
+       while :; do
+         n=$(awk "{print \$4}" /proc/$p/stat 2>/dev/null)
+         [ -n "$n" ] || break
+         [ "$n" = "0" ] && break
+         [ "$n" = "1" ] && break
+         case "$chain" in *" $n "*) break ;; esac
+         chain="$chain$n "
+         p=$n
+       done
+       for d in /proc/[0-9]*; do
+         [ -r "$d/cmdline" ] || continue
+         pid=${d#/proc/}
+         case "$chain" in *" $pid "*) continue ;; esac
+         c=$( { tr "\0" " " < "$d/cmdline"; } 2>/dev/null ) || continue
+         set -- $c
+         [ $# -eq 3 ] || continue
+         [ "$2" = "./nova.sh" ] || continue
+         [ "$3" = "watch" ] || continue
+         echo "$pid $1"
+       done )' 2>/dev/null | tr -d '\r' | sort -u
+}
+
+acquire_lock() {
+  # 1) 先扫真实进程（能看见 root 的）
+  local pids other line pid
+  pids=$(find_watch_pids)
+  other=""
+  for line in $pids; do
+    pid=${line%% *}
     [ "$pid" = "$$" ] && continue
-    [ -r "$d/cmdline" ] || continue
-    cmd=$( { tr '\0' ' ' < "$d/cmdline"; } 2>/dev/null ) || continue
-    case "$cmd" in
-      *nova.sh*watch*)
-        found=$pid
-        break
-        ;;
+    case "$pid" in
+      ''|*[!0-9]*) continue ;;
     esac
+    other="$other $pid"
   done
-  if [ -n "$found" ]; then
-    say "已有守护在跑 pid=$found，不重复起"
-    echo "$found" > "$PIDF" 2>/dev/null
+  if [ -n "${other# }" ]; then
+    say "已有守护在跑（${other# }），不重复起"
+    echo "${other# }" | awk '{print $1}' > "$PIDF" 2>/dev/null
     return 1
   fi
-  echo $$ > "$PIDF"
+
+  # 2) 原子锁兜底
+  #
+  # 为什么不再用 mkdir 锁：mkdir 锁需要「判断持锁者是否还活着」，
+  # 而 pid 会复用、pid 文件可能残留，判错就等于两个守护并存。
+  # flock 由内核管，进程一死锁自动释放，没有这个歧义。
+  #
+  # 锁放 $HOME/.nova：这个目录本来就是 0777，root（service.d）和
+  # Termux 用户（手动启动）都能写。
+  # 不要放 /data/local/tmp —— 实测权限是 drwxrwx--x shell shell，
+  # Termux 用户没有写权限，exec 9> 直接失败。更糟的是如果忽略这个
+  # 失败，flock 就作用在一个没打开的 fd 上，等于没锁。
+  if command -v flock >/dev/null 2>&1; then
+    if ! { exec 9>"$LOCKF"; } 2>/dev/null; then
+      say "✗ 打不开锁文件 $LOCKF，拒绝启动（避免两个守护并存）"
+      return 1
+    fi
+    if ! flock -n 9; then
+      say "已有守护持锁，不重复起"
+      return 1
+    fi
+    echo $$ > "$PIDF" 2>/dev/null
+    return 0
+  fi
+
+  # 没有 flock 时的兜底：mkdir 原子锁
+  R "mkdir -p /data/local/tmp 2>/dev/null; chmod 777 /data/local/tmp 2>/dev/null" >/dev/null 2>&1
+  if ! mkdir "$LOCKD" 2>/dev/null; then
+    say "锁在，不重复起"
+    return 1
+  fi
+  echo $$ > "$LOCKD/pid" 2>/dev/null
+  echo $$ > "$PIDF" 2>/dev/null
   return 0
 }
 
@@ -564,18 +712,39 @@ case "${1:-watch}" in
   status) status ;;
   install) do_install ;;
   stop)
-    if [ -f "$PIDF" ]; then
-      kill "$(cat "$PIDF")" 2>/dev/null; rm -f "$PIDF"; echo "已停"
-    else
-      pkill -f "nova.sh watch" 2>/dev/null; echo "已停"
-    fi
+    # 必须用 root 杀：service.d 起的守护是 root，Termux 的 pkill 杀不掉，
+    # 于是「停了」只是假象，老的还在跑。
+    pids=$(find_watch_pids)
+    n=0
+    for line in $pids; do
+      pid=${line%% *}
+      case "$pid" in ''|*[!0-9]*) continue ;; esac
+      R "kill -9 $pid" >/dev/null 2>&1 && n=$((n+1))
+    done
+    rm -f "$PIDF"; rm -rf "$LOCKD" 2>/dev/null
+    echo "已停 ${n} 个守护"
     ;;
   watch)
     acquire_lock || exit 1
-    trap 'rm -f "$PIDF"; exit 0' INT TERM
+    trap 'rm -f "$PIDF"; rm -rf "$LOCKD" 2>/dev/null; exit 0' INT TERM
     say "守护启动（手机独立，不依赖板子）"
+    # 一切正常时循环是静默的（这样日志才有用）。
+    # 但静默也意味着「看不出还活着」，所以每 15 轮（20s x 15 = 5 分钟）
+    # 写一行心跳，带上关键状态。开销可以忽略。
+    hb=0
     while :; do
       mode_lens
+      rc=$?
+      hb=$((hb+1))
+      if [ "$hb" -ge 15 ]; then
+        hb=0
+        # 心跳：只读状态，不下载帧
+        sh=0; ln=0; hres="-"
+        sharing && sh=1
+        hres=$(lens_probe 2>/dev/null | cut -d" " -f3)
+        frame_alive && ln=1
+        say "心跳 投屏=$sh 直播=$ln $hres rc=$rc"
+      fi
       sleep 20
     done
     ;;
