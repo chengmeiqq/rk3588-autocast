@@ -668,13 +668,17 @@ find_watch_pids() {
   #    所以父 cmdline 是三段式 nova.sh watch 的，一定是 fork 未 exec 的影子。
   #
   # 附：取 ppid 不能用 awk '{print $4}' —— /proc/pid/stat 的 comm 字段
-  # 带括号且可含空格（如 (sh -c)），字段位置会错。先剥掉括号那段。
+  # 带括号且可含空格（如 (sh -c)），字段位置会错。先剥掉括号那段，
+  # 剩下的字段是 state ppid pgrp ...，即 $1=state、$2=ppid。
+  # 实测坑：2026-11-15 写成 $1 后 ppid_of 永远返回 "S"，父进程过滤失效，
+  # 于是影子进程全被当成真守护 —— service.d 从 22:42 到 22:50 每 20s
+  # 都报「已有守护在跑」而开机自启彻底没生效。
   # shellcheck disable=SC2016
   RS 'ppid_of() {
          s=$(cat /proc/$1/stat 2>/dev/null) || return 1
-         s=${s##*)}          # 去掉 "pid (comm)" 前缀
-         set -- $s
-         echo "${1:-}"
+         s=${s##*)}          # 去掉 "pid (comm)"
+         set -- $s            # $1=state $2=ppid  ← 不是 $1！
+         echo "${2:-}"
        }
        is_nova() {
          [ -r "/proc/$1/cmdline" ] || return 1
