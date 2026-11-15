@@ -191,7 +191,15 @@ def ensure_foreground(serial):
     而且拒绝的方式是让 HTTP 线程卡在 connectHelper（不是返回错误）。
     所以开流之前必须先把 App 顶到前台，否则 ctl(streaming) 必然超时。
     实测：keepcast 投屏成功后按 HOME 回桌面，紧接着 lenscast 开流就失败。
+
+    另一个必须前置的条件：屏幕亮着。屏幕 Dozing 时 dumpsys activity 返回空，
+    foreground() 拿不到前台包名，会被误判成"App 不在前台"；而且这时
+    am start 也叫不醒屏幕，重试多少次都失败。所以先唤醒再判断。
     """
+    if awake_state(serial) != "Awake":
+        log("屏幕没亮（%s），先唤醒" % (awake_state(serial) or "未知"))
+        ensure_awake(serial)
+
     fg = foreground(serial)
     if PKG in fg:
         return True
@@ -262,7 +270,10 @@ def foreground(serial):
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
         out = p.stdout.decode("utf-8", "replace")
         if "u0 " in out:
-            return out.split("u0 ", 1)[1].split()[0]
+              # 形如 ...topResumedActivity=ActivityRecord{hash u0 com.pkg/.Act} t936}
+              # 取出的第一段会带尾部 "}"（t936} 前面那个），去掉它，
+              # 否则日志和比较都带着脏字符。
+              return out.split("u0 ", 1)[1].split()[0].rstrip("}")
         return ""
     except Exception:
         return ""
