@@ -70,6 +70,12 @@ DOUBAO=com.larus.nova
 DOUBAO_ACT=$DOUBAO/com.larus.home.impl.alias.AliasActivity1
 CALLACT=$DOUBAO/com.larus.voicecall.impl.ui.RealtimeCallActivity
 
+# 直播 App 的 HTTP 服务死掉只能靠干净重启救，而冷启动重建相机会话要时间。
+# 两次重度重启之间至少隔这么久，否则后一次会把前一次的初始化打断，
+# 结果是永远起不来（实测过：每 20s 重启一次，连 15 分钟一直 000）。
+REVIVE_GAP=300
+REVIVED_AT=0
+
 # ---------- 直播 ----------
 api_state() { curl -s -m 10 "$API/api/state"; }
 
@@ -124,7 +130,7 @@ frame_alive() {
 }
 
 ensure_lens() {
-  local p st params_ok res q z
+  local p st params_ok res q z now_t gap i
   p=$(lens_probe)
   set -- $p
   st=${1:-dead}; params_ok=${2:-0}; res=${3:--}; q=${4:-0}; z=${5:-0}
@@ -135,7 +141,37 @@ ensure_lens() {
     sleep 6
     p=$(lens_probe); set -- $p
     st=${1:-dead}; params_ok=${2:-0}; res=${3:--}; q=${4:-0}; z=${5:-0}
-    [ "$st" = "dead" ] && { say "API 仍不通"; return 1; }
+
+    # 实测：进程活着但 HTTP 服务已死的状态，am start 只会把它拉到前台，
+    # 服务不会回来（点「开始直播」也无效）。唯一有效的是干净重启进程。
+    # 此时 API 本来就不通，重启不会打断任何在跑的流，也不会动豆包的投屏。
+    if [ "$st" = "dead" ]; then
+      # 冷却：冷启动一遍要受相机初始化限制，反复重启只会互相打断。
+      # REVIVE_GAP 秒内已经重度重启过，就先不重来，只报状态。
+      local now_t gap
+      now_t=$(date +%s)
+      gap=$((now_t - ${REVIVED_AT:-0}))
+      if [ "${REVIVED_AT:-0}" != "0" ] && [ "$gap" -lt "$REVIVE_GAP" ]; then
+        say "刚重启过 ${gap}s，等它起来再说"
+        return 1
+      fi
+      REVIVED_AT=$now_t
+      say "API 仍是死的，干净重启进程"
+      R "am force-stop $PKG" >/dev/null 2>&1
+      sleep 4
+      R "am start -n $ACT" >/dev/null
+      # 冷启动要重建相机会话，实测 6～40s 不等。轮询比固定 sleep 可靠，
+      # 也不用为了最坏情况每次都白等。
+      st=dead
+      for i in $(seq 1 12); do
+        sleep 5
+        p=$(lens_probe); set -- $p
+        st=${1:-dead}; params_ok=${2:-0}; res=${3:--}; q=${4:-0}; z=${5:-0}
+        [ "$st" != "dead" ] && break
+      done
+      [ "$st" = "dead" ] && { say "重启后 60s 仍不通"; return 1; }
+      say "重启后 API 恢复"
+    fi
   fi
 
   # App 在不在前台？MIUI 只给可见前台 App 相机
@@ -322,6 +358,7 @@ ensure_share() {
   wait_online || say "网络未就绪，先试一次"
 
   # 不要让直播 App force-stop：它一死 API 就没了，而且重启后相机要重新初始化。
+  # 例外只有一种：ensure_lens 里已经确认 API 是死的——那种坏进程只能重启。
   # 豆包的投屏流程不需要独占相机（实测流着的时候豆包在前台也不报错），
   # 真要抢也是 联屏后再拉直播，不在这一步做。
   R "input keyevent KEYCODE_WAKEUP" >/dev/null
